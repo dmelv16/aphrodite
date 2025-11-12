@@ -1,0 +1,102 @@
+# Model Configuration
+models:
+  xgboost:
+    enabled: true
+    params:
+      tree_method: 'gpu_hist'
+      gpu_id: 0
+      max_depth: 8
+      learning_rate: 0.03
+      n_estimators: 1000
+      subsample: 0.8
+      colsample_bytree: 0.8
+      min_child_weight: 3
+      gamma: 0.1
+      reg_alpha: 0.1
+      reg_lambda: 1.0
+      early_stopping_rounds: 50
+      
+  lightgbm:
+    enabled: true
+    params:
+      device: 'gpu'
+      gpu_platform_id: 0
+      gpu_device_id: 0
+      num_leaves: 63
+      learning_rate: 0.03
+      n_estimators: 1000
+      subsample: 0.8
+      colsample_bytree: 0.8
+      min_child_samples: 20
+      reg_alpha: 0.1
+      reg_lambda: 1.0
+      
+  catboost:
+    enabled: true
+    params:
+      task_type: 'GPU'
+      devices: '0'
+      depth: 8
+      learning_rate: 0.03
+      iterations: 1000
+      l2_leaf_reg: 3
+      bootstrap_type: 'Bayesian'
+      subsample: 0.8
+      
+  neural_network:
+    enabled: true
+    architecture: 'tabnet'
+    params:
+      n_d: 64
+      n_a: 64
+      n_steps: 5
+      gamma: 1.5
+      n_independent: 2
+      n_shared: 2
+      momentum: 0.3
+      mask_type: 'entmax'
+      
+  multi_task:
+    enabled: true
+    shared_layers: [512, 256, 128]
+    task_heads:
+      outcome: [128, 64]
+      home_score: [64]
+      away_score: [64]
+    dropout: 0.3
+    
+ensemble:
+  method: 'stacking'
+  meta_learner: 'lightgbm'
+  use_probas: true
+  cv_folds: 5
+  
+training:
+  batch_size: 1024
+  epochs: 100
+  learning_rate: 0.001
+  weight_decay: 0.0001
+  mixed_precision: true
+  gradient_accumulation: 4
+  early_stopping_patience: 15
+  
+features:
+  rolling_windows: [5, 10, 20]
+  temporal_features: true
+  player_features: true
+  advanced_metrics: true
+  embeddings:
+    player_dim: 32
+    team_dim: 16
+    venue_dim: 8
+    
+evaluation:
+  cv_strategy: 'time_series'
+  n_splits: 5
+  test_size_games: 500
+  metrics:
+    - 'accuracy'
+    - 'log_loss'
+    - 'brier_score'
+    - 'roc_auc'
+    - 'calibration_error'
