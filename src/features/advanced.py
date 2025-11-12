@@ -72,7 +72,7 @@ class AdvancedFeatureEngine:
         
         # FIXED: Calculate total faceoffs per game FIRST
         total_faceoffs_game = (
-            events_df[events_df['type_code'] == 'FACEOFF']
+            events_df[events_df['type_code'] == '502']
             .groupby('game_id')['event_id']
             .count()
             .to_frame('faceoffs_total_game')
@@ -82,19 +82,19 @@ class AdvancedFeatureEngine:
         event_features = events_df.groupby(['game_id', 'event_owner_team_id']).apply(
             lambda x: pd.Series({
                 # Possession proxies
-                'faceoff_wins': (x['type_code'] == 'FACEOFF').sum(),
+                'faceoff_wins': (x['type_code'] == '502').sum(),
                 
                 # Physical play
-                'hits_delivered': (x['type_code'] == 'HIT').sum(),
-                'blocked_shots': (x['type_code'] == 'BLOCKED_SHOT').sum(),
+                'hits_delivered': (x['type_code'] == '503').sum(),
+                'blocked_shots': (x['type_code'] == '508').sum(),
                 
                 # Turnovers
-                'giveaways': (x['type_code'] == 'GIVEAWAY').sum(),
-                'takeaways': (x['type_code'] == 'TAKEAWAY').sum(),
+                'giveaways': (x['type_code'] == '504').sum(),
+                'takeaways': (x['type_code'] == '525').sum(),
                 
                 # Penalties
-                'penalties_taken': (x['type_code'] == 'PENALTY').sum(),
-                'penalty_minutes': x[x['type_code'] == 'PENALTY']['penalty_duration'].sum(),
+                'penalties_taken': (x['type_code'] == '509').sum(),
+                'penalty_minutes': x[x['type_code'] == '509']['penalty_duration'].sum(),
                 
                 # Zone control (approximate)
                 'offensive_zone_events': (x['zone_code'] == 'O').sum(),
@@ -102,12 +102,12 @@ class AdvancedFeatureEngine:
                 'neutral_zone_events': (x['zone_code'] == 'N').sum(),
                 
                 # FIXED: Shot attempts (Fenwick proxy - removed BLOCKED_SHOT)
-                'shot_attempts': (x['type_code'].isin(['SHOT', 'MISSED_SHOT'])).sum(),
+                'shot_attempts': (x['type_code'].isin(['506', '507'])).sum(),
                 
                 # Scoring chances by period
-                'period_1_shots': ((x['period_number'] == 1) & (x['type_code'] == 'SHOT')).sum(),
-                'period_2_shots': ((x['period_number'] == 2) & (x['type_code'] == 'SHOT')).sum(),
-                'period_3_shots': ((x['period_number'] == 3) & (x['type_code'] == 'SHOT')).sum()
+                'period_1_shots': ((x['period_number'] == 1) & (x['type_code'] == '506')).sum(),
+                'period_2_shots': ((x['period_number'] == 2) & (x['type_code'] == '506')).sum(),
+                'period_3_shots': ((x['period_number'] == 3) & (x['type_code'] == '506')).sum()
             })
         ).reset_index()
         
