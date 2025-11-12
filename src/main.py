@@ -399,8 +399,8 @@ def main():
     
     # Database connection string (update with your credentials)
     connection_string = (
-        "DRIVER={SQL Server};"
-        "SERVER=your_server;"
+        "DRIVER={ODBC Driver 17 for SQL Server};"
+        "SERVER=DESKTOP-J9IV3OH;"
         "DATABASE=nhlDB;"
         "Trusted_Connection=yes;"
     )
