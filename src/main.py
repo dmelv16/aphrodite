@@ -70,7 +70,7 @@ class NHLPredictionPipeline:
         
         # Load all tables
         raw_data = loader.load_all_for_modeling(
-            start_season=20182019,
+            start_season=20092010,
             end_season=20242025
         )
         

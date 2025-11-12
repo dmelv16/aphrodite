@@ -70,12 +70,19 @@ class AdvancedFeatureEngine:
     def calculate_event_based_features(self, events_df: pd.DataFrame) -> pd.DataFrame:
         """Calculate features from play-by-play events"""
         
+        # FIXED: Calculate total faceoffs per game FIRST
+        total_faceoffs_game = (
+            events_df[events_df['type_code'] == 'FACEOFF']
+            .groupby('game_id')['event_id']
+            .count()
+            .to_frame('faceoffs_total_game')
+        )
+        
         # Aggregate by game and team
         event_features = events_df.groupby(['game_id', 'event_owner_team_id']).apply(
             lambda x: pd.Series({
                 # Possession proxies
                 'faceoff_wins': (x['type_code'] == 'FACEOFF').sum(),
-                'faceoffs_total': (x['type_code'] == 'FACEOFF').sum(),
                 
                 # Physical play
                 'hits_delivered': (x['type_code'] == 'HIT').sum(),
@@ -94,8 +101,8 @@ class AdvancedFeatureEngine:
                 'defensive_zone_events': (x['zone_code'] == 'D').sum(),
                 'neutral_zone_events': (x['zone_code'] == 'N').sum(),
                 
-                # Shot attempts (Corsi proxy)
-                'shot_attempts': (x['type_code'].isin(['SHOT', 'MISSED_SHOT', 'BLOCKED_SHOT'])).sum(),
+                # FIXED: Shot attempts (Fenwick proxy - removed BLOCKED_SHOT)
+                'shot_attempts': (x['type_code'].isin(['SHOT', 'MISSED_SHOT'])).sum(),
                 
                 # Scoring chances by period
                 'period_1_shots': ((x['period_number'] == 1) & (x['type_code'] == 'SHOT')).sum(),
@@ -106,10 +113,15 @@ class AdvancedFeatureEngine:
         
         event_features.rename(columns={'event_owner_team_id': 'team_id'}, inplace=True)
         
-        # Calculate derived metrics
+        # FIXED: Merge the total faceoffs per game
+        event_features = event_features.merge(total_faceoffs_game, on='game_id', how='left')
+        
+        # FIXED: Calculate faceoff_win_pct using total game faceoffs
         event_features['faceoff_win_pct'] = (
-            event_features['faceoff_wins'] / event_features['faceoffs_total'].replace(0, 1)
+            event_features['faceoff_wins'] / event_features['faceoffs_total_game'].replace(0, 1)
         )
+        
+        # Calculate derived metrics
         event_features['giveaway_takeaway_diff'] = (
             event_features['takeaways'] - event_features['giveaways']
         )
@@ -123,7 +135,7 @@ class AdvancedFeatureEngine:
     def calculate_goalie_features(self, 
                                   shot_xg_df: pd.DataFrame,
                                   team_game_xg_df: pd.DataFrame) -> pd.DataFrame:
-        """Calculate goalie-specific performance metrics"""
+        """Calculate goalie-specific performance metrics (GSAx)"""
         
         # Shots faced by goalie
         goalie_shots = shot_xg_df.groupby(['game_id', 'goalie_in_net_id']).agg({
@@ -142,7 +154,7 @@ class AdvancedFeatureEngine:
             'is_high_danger_<lambda>': 'high_danger_shots_faced'
         }, inplace=True)
         
-        # Calculate saves above expected
+        # Calculate saves above expected (GSAx)
         goalie_shots['saves'] = goalie_shots['shots_faced'] - goalie_shots['goals_allowed']
         goalie_shots['expected_goals_allowed'] = goalie_shots['xG_faced']
         goalie_shots['goals_saved_above_expected'] = (
@@ -154,124 +166,113 @@ class AdvancedFeatureEngine:
         
         return goalie_shots
     
-    def calculate_matchup_features(self, 
-                                   schedule_df: pd.DataFrame,
-                                   lookback_games: int = 5) -> pd.DataFrame:
-        """Calculate head-to-head matchup history"""
-        
-        matchups = []
-        
-        for idx, game in schedule_df.iterrows():
-            home_id = game['homeTeam_id']
-            away_id = game['awayTeam_id']
-            game_date = game['gameDate']
-            
-            # Get previous meetings
-            previous = schedule_df[
-                (schedule_df['gameDate'] < game_date) &
-                (
-                    ((schedule_df['homeTeam_id'] == home_id) & (schedule_df['awayTeam_id'] == away_id)) |
-                    ((schedule_df['homeTeam_id'] == away_id) & (schedule_df['awayTeam_id'] == home_id))
-                )
-            ].tail(lookback_games)
-            
-            if len(previous) > 0:
-                # Calculate matchup stats
-                home_wins = previous[
-                    ((previous['homeTeam_id'] == home_id) & (previous['homeTeam_score'] > previous['awayTeam_score'])) |
-                    ((previous['awayTeam_id'] == home_id) & (previous['awayTeam_score'] > previous['homeTeam_score']))
-                ].shape[0]
-                
-                matchups.append({
-                    'game_id': game['game_id'],
-                    'matchup_games_played': len(previous),
-                    'home_matchup_wins': home_wins,
-                    'away_matchup_wins': len(previous) - home_wins,
-                    'avg_total_goals_matchup': (
-                        previous['homeTeam_score'].mean() + previous['awayTeam_score'].mean()
-                    )
-                })
-            else:
-                matchups.append({
-                    'game_id': game['game_id'],
-                    'matchup_games_played': 0,
-                    'home_matchup_wins': 0,
-                    'away_matchup_wins': 0,
-                    'avg_total_goals_matchup': 5.5  # League average
-                })
-        
-        return pd.DataFrame(matchups)
-    
-    def calculate_rolling_correlations(self, 
-                                       df: pd.DataFrame,
-                                       col1: str,
-                                       col2: str,
-                                       window: int = 10) -> pd.Series:
-        """Calculate rolling correlation between two metrics"""
-        return df.groupby('team_id').apply(
-            lambda x: x[col1].rolling(window).corr(x[col2])
-        ).reset_index(level=0, drop=True)
-    
-    def calculate_consistency_metrics(self, df: pd.DataFrame, windows: List[int] = [5, 10]) -> pd.DataFrame:
-        """Calculate team consistency/volatility metrics"""
-        result_df = df.copy()
-        
-        for window in windows:
-            # Goal scoring consistency
-            result_df[f'goal_scoring_cv_{window}'] = (
-                result_df.groupby('team_id')['goals_for']
-                .transform(lambda x: x.rolling(window).std() / x.rolling(window).mean())
-            )
-            
-            # Performance consistency (points)
-            result_df[f'performance_consistency_{window}'] = (
-                result_df.groupby('team_id')['points']
-                .transform(lambda x: 1 / (1 + x.rolling(window).std()))
-            )
-        
-        return result_df
-    
     def generate_all_advanced_features(self,
                                        schedule_df: pd.DataFrame,
                                        shot_xg_df: pd.DataFrame,
                                        team_game_xg_df: pd.DataFrame,
                                        events_df: pd.DataFrame) -> pd.DataFrame:
-        """Generate all advanced features"""
+        """Generate all advanced features and merge them properly"""
         logger.info("Generating advanced features...")
         
         # Calculate all feature types
         xg_features = self.calculate_xg_features(shot_xg_df, team_game_xg_df)
         event_features = self.calculate_event_based_features(events_df)
         goalie_features = self.calculate_goalie_features(shot_xg_df, team_game_xg_df)
-        matchup_features = self.calculate_matchup_features(schedule_df)
         
-        # Merge all features
+        # Start with schedule
         advanced_df = schedule_df.copy()
         
-        # Merge home team features
+        # === MERGE HOME TEAM FEATURES ===
+        
+        # Home xG features
         home_xg = xg_features.copy()
         home_xg.columns = ['home_' + col if col not in ['game_id', 'team_id'] else col for col in home_xg.columns]
         advanced_df = advanced_df.merge(
-            home_xg[home_xg['team_id'] == advanced_df['homeTeam_id']],
+            home_xg,
             left_on=['game_id', 'homeTeam_id'],
             right_on=['game_id', 'team_id'],
-            how='left',
-            suffixes=('', '_home')
+            how='left'
         )
+        advanced_df.drop('team_id', axis=1, inplace=True, errors='ignore')
         
-        # Merge away team features
+        # Home event features
+        home_events = event_features.copy()
+        home_events.columns = ['home_' + col if col not in ['game_id', 'team_id'] else col for col in home_events.columns]
+        advanced_df = advanced_df.merge(
+            home_events,
+            left_on=['game_id', 'homeTeam_id'],
+            right_on=['game_id', 'team_id'],
+            how='left'
+        )
+        advanced_df.drop('team_id', axis=1, inplace=True, errors='ignore')
+        
+        # Home goalie features (requires matching on goalie_id)
+        # First, get home goalie IDs from team_game_xg_df
+        home_goalie_map = team_game_xg_df[['game_id', 'team_id', 'goalie_id']].copy()
+        home_goalie_map = home_goalie_map.rename(columns={'goalie_id': 'home_goalie_id'})
+        advanced_df = advanced_df.merge(
+            home_goalie_map,
+            left_on=['game_id', 'homeTeam_id'],
+            right_on=['game_id', 'team_id'],
+            how='left'
+        )
+        advanced_df.drop('team_id', axis=1, inplace=True, errors='ignore')
+        
+        # Now merge goalie features
+        home_goalie = goalie_features.copy()
+        home_goalie.columns = ['home_' + col if col not in ['game_id', 'goalie_id'] else col for col in home_goalie.columns]
+        advanced_df = advanced_df.merge(
+            home_goalie,
+            left_on=['game_id', 'home_goalie_id'],
+            right_on=['game_id', 'goalie_id'],
+            how='left'
+        )
+        advanced_df.drop('goalie_id', axis=1, inplace=True, errors='ignore')
+        
+        # === MERGE AWAY TEAM FEATURES ===
+        
+        # Away xG features
         away_xg = xg_features.copy()
         away_xg.columns = ['away_' + col if col not in ['game_id', 'team_id'] else col for col in away_xg.columns]
         advanced_df = advanced_df.merge(
-            away_xg[away_xg['team_id'] == advanced_df['awayTeam_id']],
+            away_xg,
             left_on=['game_id', 'awayTeam_id'],
             right_on=['game_id', 'team_id'],
-            how='left',
-            suffixes=('', '_away')
+            how='left'
         )
+        advanced_df.drop('team_id', axis=1, inplace=True, errors='ignore')
         
-        # Add matchup features
-        advanced_df = advanced_df.merge(matchup_features, on='game_id', how='left')
+        # Away event features
+        away_events = event_features.copy()
+        away_events.columns = ['away_' + col if col not in ['game_id', 'team_id'] else col for col in away_events.columns]
+        advanced_df = advanced_df.merge(
+            away_events,
+            left_on=['game_id', 'awayTeam_id'],
+            right_on=['game_id', 'team_id'],
+            how='left'
+        )
+        advanced_df.drop('team_id', axis=1, inplace=True, errors='ignore')
         
-        logger.info(f"Generated {len(advanced_df.columns)} advanced features")
+        # Away goalie features
+        away_goalie_map = team_game_xg_df[['game_id', 'team_id', 'goalie_id']].copy()
+        away_goalie_map = away_goalie_map.rename(columns={'goalie_id': 'away_goalie_id'})
+        advanced_df = advanced_df.merge(
+            away_goalie_map,
+            left_on=['game_id', 'awayTeam_id'],
+            right_on=['game_id', 'team_id'],
+            how='left'
+        )
+        advanced_df.drop('team_id', axis=1, inplace=True, errors='ignore')
+        
+        away_goalie = goalie_features.copy()
+        away_goalie.columns = ['away_' + col if col not in ['game_id', 'goalie_id'] else col for col in away_goalie.columns]
+        advanced_df = advanced_df.merge(
+            away_goalie,
+            left_on=['game_id', 'away_goalie_id'],
+            right_on=['game_id', 'goalie_id'],
+            how='left'
+        )
+        advanced_df.drop('goalie_id', axis=1, inplace=True, errors='ignore')
+        
+        logger.info(f"Generated {len(advanced_df.columns)} total advanced features")
         return advanced_df

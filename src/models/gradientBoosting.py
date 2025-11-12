@@ -1,277 +1,272 @@
-import pandas as pd
+import xgboost as xgb
 import numpy as np
-from typing import Dict, List
+import pandas as pd
+from typing import Dict, Any, Optional, Tuple
 import logging
+from sklearn.model_selection import cross_val_score
+import joblib
 
 logger = logging.getLogger(__name__)
 
-class AdvancedFeatureEngine:
-    """Generate advanced analytics features from xG and event data"""
+class XGBoostModel:
+    """XGBoost model with GPU acceleration for NHL game prediction"""
     
-    def __init__(self):
-        pass
+    def __init__(self, task: str = 'classification', params: Optional[Dict[str, Any]] = None):
+        """
+        Initialize XGBoost model
+        
+        Args:
+            task: 'classification', 'regression', or 'multiclass'
+            params: Model hyperparameters
+        """
+        self.task = task
+        self.model = None
+        self.feature_names = None
+        self.best_iteration = None
+        
+        # Default parameters optimized for GPU
+        self.params = {
+            'tree_method': 'gpu_hist',
+            'gpu_id': 0,
+            'predictor': 'gpu_predictor',
+            'max_depth': 8,
+            'learning_rate': 0.03,
+            'n_estimators': 1000,
+            'subsample': 0.8,
+            'colsample_bytree': 0.8,
+            'min_child_weight': 3,
+            'gamma': 0.1,
+            'reg_alpha': 0.1,
+            'reg_lambda': 1.0,
+            'random_state': 42,
+            'n_jobs': -1
+        }
+        
+        # Update with user params
+        if params:
+            self.params.update(params)
+        
+        # Set objective based on task
+        if task == 'classification':
+            self.params['objective'] = 'binary:logistic'
+            self.params['eval_metric'] = ['logloss', 'auc']
+        elif task == 'multiclass':
+            self.params['objective'] = 'multi:softprob'
+            self.params['eval_metric'] = ['mlogloss']
+        elif task == 'regression':
+            self.params['objective'] = 'reg:squarederror'
+            self.params['eval_metric'] = ['rmse', 'mae']
+        
+        logger.info(f"Initialized XGBoost {task} model with GPU acceleration")
     
-    def calculate_xg_features(self, 
-                             shot_xg_df: pd.DataFrame,
-                             team_game_xg_df: pd.DataFrame) -> pd.DataFrame:
-        """Calculate advanced xG-based features"""
+    def train(self, 
+              X_train: pd.DataFrame,
+              y_train: np.ndarray,
+              X_val: Optional[pd.DataFrame] = None,
+              y_val: Optional[np.ndarray] = None,
+              early_stopping_rounds: int = 50,
+              verbose: int = 50) -> Dict[str, Any]:
+        """
+        Train XGBoost model with early stopping
         
-        # Shot quality metrics by game
-        shot_quality = shot_xg_df.groupby(['game_id', 'event_owner_team_id']).agg({
-            'xG': ['mean', 'std', 'sum', 'max'],
-            'is_slot': 'mean',
-            'is_rebound': 'mean',
-            'is_rush': 'mean',
-            'is_high_danger': lambda x: (x > 0.15).mean(),  # Custom high-danger threshold
-            'distance': ['mean', 'std'],
-            'angle': ['mean', 'std']
-        }).reset_index()
+        Returns:
+            Dictionary with training history and metrics
+        """
+        self.feature_names = X_train.columns.tolist()
         
-        shot_quality.columns = ['_'.join(col).strip('_') for col in shot_quality.columns]
-        shot_quality.rename(columns={
-            'event_owner_team_id': 'team_id',
-            'xG_mean': 'avg_shot_quality',
-            'xG_std': 'shot_quality_variance',
-            'xG_sum': 'total_xG',
-            'xG_max': 'best_chance_xG',
-            'is_slot_mean': 'pct_slot_shots',
-            'is_rebound_mean': 'pct_rebound_shots',
-            'is_rush_mean': 'pct_rush_shots',
-            'is_high_danger_<lambda>': 'pct_high_danger_shots'
-        }, inplace=True)
+        # Create DMatrix for efficient GPU processing
+        dtrain = xgb.DMatrix(X_train, label=y_train, feature_names=self.feature_names)
         
-        # Situational xG efficiency
-        situational = shot_xg_df.groupby(['game_id', 'event_owner_team_id']).apply(
-            lambda x: pd.Series({
-                'xG_5v5': x[x['is_even_strength'] == 1]['xG'].sum(),
-                'xG_PP': x[x['is_powerplay'] == 1]['xG'].sum(),
-                'xG_SH': x[x['is_shorthanded'] == 1]['xG'].sum(),
-                'shots_5v5': (x['is_even_strength'] == 1).sum(),
-                'shots_PP': (x['is_powerplay'] == 1).sum(),
-                'shots_SH': (x['is_shorthanded'] == 1).sum()
-            })
-        ).reset_index()
+        eval_list = [(dtrain, 'train')]
+        if X_val is not None and y_val is not None:
+            dval = xgb.DMatrix(X_val, label=y_val, feature_names=self.feature_names)
+            eval_list.append((dval, 'validation'))
         
-        situational.rename(columns={'event_owner_team_id': 'team_id'}, inplace=True)
+        # Training with callbacks
+        evals_result = {}
         
-        # Merge all xG features
-        xg_features = shot_quality.merge(situational, on=['game_id', 'team_id'], how='left')
-        xg_features = xg_features.merge(team_game_xg_df, on=['game_id', 'team_id'], how='left')
-        
-        # Calculate over/under performance
-        xg_features['goals_above_expected'] = xg_features['goals_for'] - xg_features['xG_for']
-        xg_features['goals_against_above_expected'] = xg_features['goals_against'] - xg_features['xG_against']
-        
-        # PDO proxy (shooting% + save%)
-        xg_features['pdo'] = xg_features['shooting_percentage'] + xg_features['save_percentage']
-        
-        return xg_features
-    
-    def calculate_event_based_features(self, events_df: pd.DataFrame) -> pd.DataFrame:
-        """Calculate features from play-by-play events"""
-        
-        # Aggregate by game and team
-        event_features = events_df.groupby(['game_id', 'event_owner_team_id']).apply(
-            lambda x: pd.Series({
-                # Possession proxies
-                'faceoff_wins': (x['type_code'] == 'FACEOFF').sum(),
-                'faceoffs_total': (x['type_code'] == 'FACEOFF').sum(),
-                
-                # Physical play
-                'hits_delivered': (x['type_code'] == 'HIT').sum(),
-                'blocked_shots': (x['type_code'] == 'BLOCKED_SHOT').sum(),
-                
-                # Turnovers
-                'giveaways': (x['type_code'] == 'GIVEAWAY').sum(),
-                'takeaways': (x['type_code'] == 'TAKEAWAY').sum(),
-                
-                # Penalties
-                'penalties_taken': (x['type_code'] == 'PENALTY').sum(),
-                'penalty_minutes': x[x['type_code'] == 'PENALTY']['penalty_duration'].sum(),
-                
-                # Zone control (approximate)
-                'offensive_zone_events': (x['zone_code'] == 'O').sum(),
-                'defensive_zone_events': (x['zone_code'] == 'D').sum(),
-                'neutral_zone_events': (x['zone_code'] == 'N').sum(),
-                
-                # Shot attempts (Corsi proxy)
-                'shot_attempts': (x['type_code'].isin(['SHOT', 'MISSED_SHOT', 'BLOCKED_SHOT'])).sum(),
-                
-                # Scoring chances by period
-                'period_1_shots': ((x['period_number'] == 1) & (x['type_code'] == 'SHOT')).sum(),
-                'period_2_shots': ((x['period_number'] == 2) & (x['type_code'] == 'SHOT')).sum(),
-                'period_3_shots': ((x['period_number'] == 3) & (x['type_code'] == 'SHOT')).sum()
-            })
-        ).reset_index()
-        
-        event_features.rename(columns={'event_owner_team_id': 'team_id'}, inplace=True)
-        
-        # Calculate derived metrics
-        event_features['faceoff_win_pct'] = (
-            event_features['faceoff_wins'] / event_features['faceoffs_total'].replace(0, 1)
-        )
-        event_features['giveaway_takeaway_diff'] = (
-            event_features['takeaways'] - event_features['giveaways']
-        )
-        event_features['zone_control_index'] = (
-            event_features['offensive_zone_events'] / 
-            (event_features['offensive_zone_events'] + event_features['defensive_zone_events']).replace(0, 1)
+        logger.info("Training XGBoost model on GPU...")
+        self.model = xgb.train(
+            self.params,
+            dtrain,
+            num_boost_round=self.params.get('n_estimators', 1000),
+            evals=eval_list,
+            evals_result=evals_result,
+            early_stopping_rounds=early_stopping_rounds,
+            verbose_eval=verbose
         )
         
-        return event_features
+        self.best_iteration = self.model.best_iteration
+        logger.info(f"Training completed. Best iteration: {self.best_iteration}")
+        
+        return evals_result
     
-    def calculate_goalie_features(self, 
-                                  shot_xg_df: pd.DataFrame,
-                                  team_game_xg_df: pd.DataFrame) -> pd.DataFrame:
-        """Calculate goalie-specific performance metrics"""
+    def predict(self, X: pd.DataFrame) -> np.ndarray:
+        """Make predictions"""
+        if self.model is None:
+            raise ValueError("Model not trained. Call train() first.")
         
-        # Shots faced by goalie
-        goalie_shots = shot_xg_df.groupby(['game_id', 'goalie_in_net_id']).agg({
-            'xG': ['sum', 'mean', 'count'],
-            'is_goal': 'sum',
-            'is_high_danger': lambda x: (x > 0.15).sum()
-        }).reset_index()
+        dtest = xgb.DMatrix(X, feature_names=self.feature_names)
         
-        goalie_shots.columns = ['_'.join(col).strip('_') for col in goalie_shots.columns]
-        goalie_shots.rename(columns={
-            'goalie_in_net_id': 'goalie_id',
-            'xG_sum': 'xG_faced',
-            'xG_mean': 'avg_xG_faced',
-            'xG_count': 'shots_faced',
-            'is_goal_sum': 'goals_allowed',
-            'is_high_danger_<lambda>': 'high_danger_shots_faced'
-        }, inplace=True)
-        
-        # Calculate saves above expected
-        goalie_shots['saves'] = goalie_shots['shots_faced'] - goalie_shots['goals_allowed']
-        goalie_shots['expected_goals_allowed'] = goalie_shots['xG_faced']
-        goalie_shots['goals_saved_above_expected'] = (
-            goalie_shots['expected_goals_allowed'] - goalie_shots['goals_allowed']
-        )
-        goalie_shots['save_percentage'] = (
-            goalie_shots['saves'] / goalie_shots['shots_faced'].replace(0, 1)
-        )
-        
-        return goalie_shots
+        if self.task == 'multiclass':
+            # Returns probability for each class
+            return self.model.predict(dtest)
+        else:
+            return self.model.predict(dtest)
     
-    def calculate_matchup_features(self, 
-                                   schedule_df: pd.DataFrame,
-                                   lookback_games: int = 5) -> pd.DataFrame:
-        """Calculate head-to-head matchup history"""
+    def predict_proba(self, X: pd.DataFrame) -> np.ndarray:
+        """Predict class probabilities"""
+        if self.task == 'regression':
+            raise ValueError("predict_proba not available for regression tasks")
         
-        matchups = []
+        return self.predict(X)
+    
+    def get_feature_importance(self, importance_type: str = 'gain') -> pd.DataFrame:
+        """
+        Get feature importance
         
-        for idx, game in schedule_df.iterrows():
-            home_id = game['homeTeam_id']
-            away_id = game['awayTeam_id']
-            game_date = game['gameDate']
+        Args:
+            importance_type: 'gain', 'weight', 'cover', or 'total_gain'
+        """
+        if self.model is None:
+            raise ValueError("Model not trained")
+        
+        importance = self.model.get_score(importance_type=importance_type)
+        
+        # Create dataframe
+        importance_df = pd.DataFrame([
+            {'feature': k, 'importance': v} 
+            for k, v in importance.items()
+        ]).sort_values('importance', ascending=False)
+        
+        return importance_df
+    
+    def get_shap_values(self, X: pd.DataFrame) -> np.ndarray:
+        """Calculate SHAP values for interpretability"""
+        if self.model is None:
+            raise ValueError("Model not trained")
+        
+        dtest = xgb.DMatrix(X, feature_names=self.feature_names)
+        return self.model.predict(dtest, pred_contribs=True)
+    
+    def save_model(self, filepath: str):
+        """Save model to disk"""
+        if self.model is None:
+            raise ValueError("No model to save")
+        
+        # Save XGBoost model
+        self.model.save_model(f"{filepath}.json")
+        
+        # Save additional attributes
+        metadata = {
+            'feature_names': self.feature_names,
+            'params': self.params,
+            'task': self.task,
+            'best_iteration': self.best_iteration
+        }
+        joblib.dump(metadata, f"{filepath}_metadata.pkl")
+        
+        logger.info(f"Model saved to {filepath}")
+    
+    def load_model(self, filepath: str):
+        """Load model from disk"""
+        # Load XGBoost model
+        self.model = xgb.Booster()
+        self.model.load_model(f"{filepath}.json")
+        
+        # Load metadata
+        metadata = joblib.load(f"{filepath}_metadata.pkl")
+        self.feature_names = metadata['feature_names']
+        self.params = metadata['params']
+        self.task = metadata['task']
+        self.best_iteration = metadata['best_iteration']
+        
+        logger.info(f"Model loaded from {filepath}")
+    
+    def cross_validate(self,
+                      X: pd.DataFrame,
+                      y: np.ndarray,
+                      cv: int = 5,
+                      scoring: str = 'neg_log_loss') -> Dict[str, float]:
+        """
+        Perform cross-validation
+        
+        Returns:
+            Dictionary with mean and std of scores
+        """
+        # Create sklearn-compatible model
+        if self.task == 'classification':
+            model = xgb.XGBClassifier(**self.params)
+        elif self.task == 'multiclass':
+            model = xgb.XGBClassifier(**self.params)
+        else:
+            model = xgb.XGBRegressor(**self.params)
+        
+        scores = cross_val_score(model, X, y, cv=cv, scoring=scoring, n_jobs=1)
+        
+        return {
+            'mean_score': scores.mean(),
+            'std_score': scores.std(),
+            'all_scores': scores
+        }
+
+
+class XGBoostEnsemble:
+    """Ensemble of XGBoost models for robust predictions"""
+    
+    def __init__(self, n_models: int = 5, task: str = 'classification', base_params: Optional[Dict] = None):
+        self.n_models = n_models
+        self.task = task
+        self.models = []
+        self.base_params = base_params or {}
+        
+    def train(self,
+             X_train: pd.DataFrame,
+             y_train: np.ndarray,
+             X_val: Optional[pd.DataFrame] = None,
+             y_val: Optional[np.ndarray] = None):
+        """Train ensemble with different random seeds"""
+        
+        for i in range(self.n_models):
+            logger.info(f"Training ensemble model {i+1}/{self.n_models}")
             
-            # Get previous meetings
-            previous = schedule_df[
-                (schedule_df['gameDate'] < game_date) &
-                (
-                    ((schedule_df['homeTeam_id'] == home_id) & (schedule_df['awayTeam_id'] == away_id)) |
-                    ((schedule_df['homeTeam_id'] == away_id) & (schedule_df['awayTeam_id'] == home_id))
-                )
-            ].tail(lookback_games)
+            # Different random seed for each model
+            params = self.base_params.copy()
+            params['random_state'] = 42 + i
             
-            if len(previous) > 0:
-                # Calculate matchup stats
-                home_wins = previous[
-                    ((previous['homeTeam_id'] == home_id) & (previous['homeTeam_score'] > previous['awayTeam_score'])) |
-                    ((previous['awayTeam_id'] == home_id) & (previous['awayTeam_score'] > previous['homeTeam_score']))
-                ].shape[0]
-                
-                matchups.append({
-                    'game_id': game['game_id'],
-                    'matchup_games_played': len(previous),
-                    'home_matchup_wins': home_wins,
-                    'away_matchup_wins': len(previous) - home_wins,
-                    'avg_total_goals_matchup': (
-                        previous['homeTeam_score'].mean() + previous['awayTeam_score'].mean()
-                    )
-                })
-            else:
-                matchups.append({
-                    'game_id': game['game_id'],
-                    'matchup_games_played': 0,
-                    'home_matchup_wins': 0,
-                    'away_matchup_wins': 0,
-                    'avg_total_goals_matchup': 5.5  # League average
-                })
-        
-        return pd.DataFrame(matchups)
-    
-    def calculate_rolling_correlations(self, 
-                                       df: pd.DataFrame,
-                                       col1: str,
-                                       col2: str,
-                                       window: int = 10) -> pd.Series:
-        """Calculate rolling correlation between two metrics"""
-        return df.groupby('team_id').apply(
-            lambda x: x[col1].rolling(window).corr(x[col2])
-        ).reset_index(level=0, drop=True)
-    
-    def calculate_consistency_metrics(self, df: pd.DataFrame, windows: List[int] = [5, 10]) -> pd.DataFrame:
-        """Calculate team consistency/volatility metrics"""
-        result_df = df.copy()
-        
-        for window in windows:
-            # Goal scoring consistency
-            result_df[f'goal_scoring_cv_{window}'] = (
-                result_df.groupby('team_id')['goals_for']
-                .transform(lambda x: x.rolling(window).std() / x.rolling(window).mean())
-            )
+            model = XGBoostModel(task=self.task, params=params)
+            model.train(X_train, y_train, X_val, y_val)
             
-            # Performance consistency (points)
-            result_df[f'performance_consistency_{window}'] = (
-                result_df.groupby('team_id')['points']
-                .transform(lambda x: 1 / (1 + x.rolling(window).std()))
-            )
-        
-        return result_df
+            self.models.append(model)
     
-    def generate_all_advanced_features(self,
-                                       schedule_df: pd.DataFrame,
-                                       shot_xg_df: pd.DataFrame,
-                                       team_game_xg_df: pd.DataFrame,
-                                       events_df: pd.DataFrame) -> pd.DataFrame:
-        """Generate all advanced features"""
-        logger.info("Generating advanced features...")
+    def predict(self, X: pd.DataFrame) -> np.ndarray:
+        """Average predictions from all models"""
+        predictions = np.array([model.predict(X) for model in self.models])
+        return predictions.mean(axis=0)
+    
+    def predict_with_uncertainty(self, X: pd.DataFrame) -> Tuple[np.ndarray, np.ndarray]:
+        """
+        Get predictions with uncertainty estimates
         
-        # Calculate all feature types
-        xg_features = self.calculate_xg_features(shot_xg_df, team_game_xg_df)
-        event_features = self.calculate_event_based_features(events_df)
-        goalie_features = self.calculate_goalie_features(shot_xg_df, team_game_xg_df)
-        matchup_features = self.calculate_matchup_features(schedule_df)
+        Returns:
+            mean_predictions, std_predictions
+        """
+        predictions = np.array([model.predict(X) for model in self.models])
+        return predictions.mean(axis=0), predictions.std(axis=0)
+    
+    def save_ensemble(self, base_filepath: str):
+        """Save all models in ensemble"""
+        for i, model in enumerate(self.models):
+            model.save_model(f"{base_filepath}_model_{i}")
         
-        # Merge all features
-        advanced_df = schedule_df.copy()
+        logger.info(f"Ensemble saved to {base_filepath}")
+    
+    def load_ensemble(self, base_filepath: str):
+        """Load all models in ensemble"""
+        self.models = []
+        for i in range(self.n_models):
+            model = XGBoostModel(task=self.task)
+            model.load_model(f"{base_filepath}_model_{i}")
+            self.models.append(model)
         
-        # Merge home team features
-        home_xg = xg_features.copy()
-        home_xg.columns = ['home_' + col if col not in ['game_id', 'team_id'] else col for col in home_xg.columns]
-        advanced_df = advanced_df.merge(
-            home_xg[home_xg['team_id'] == advanced_df['homeTeam_id']],
-            left_on=['game_id', 'homeTeam_id'],
-            right_on=['game_id', 'team_id'],
-            how='left',
-            suffixes=('', '_home')
-        )
-        
-        # Merge away team features
-        away_xg = xg_features.copy()
-        away_xg.columns = ['away_' + col if col not in ['game_id', 'team_id'] else col for col in away_xg.columns]
-        advanced_df = advanced_df.merge(
-            away_xg[away_xg['team_id'] == advanced_df['awayTeam_id']],
-            left_on=['game_id', 'awayTeam_id'],
-            right_on=['game_id', 'team_id'],
-            how='left',
-            suffixes=('', '_away')
-        )
-        
-        # Add matchup features
-        advanced_df = advanced_df.merge(matchup_features, on='game_id', how='left')
-        
-        logger.info(f"Generated {len(advanced_df.columns)} advanced features")
-        return advanced_df
+        logger.info(f"Ensemble loaded from {base_filepath}")

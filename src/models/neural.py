@@ -7,15 +7,30 @@ import pandas as pd
 from typing import Dict, List, Tuple, Optional
 import logging
 from sklearn.preprocessing import StandardScaler
+from enum import Enum
 
 logger = logging.getLogger(__name__)
 
+
+class ScoreLossType(Enum):
+    """Loss function types for score prediction"""
+    MSE = "mse"
+    POISSON = "poisson"
+    HYBRID = "hybrid"
+
+
 class NHLDataset(Dataset):
-    """PyTorch Dataset for NHL game data"""
+    """PyTorch Dataset for NHL game data with type-optimized targets"""
     
     def __init__(self, X: np.ndarray, y_dict: Dict[str, np.ndarray]):
         self.X = torch.FloatTensor(X)
-        self.y_dict = {k: torch.FloatTensor(v) for k, v in y_dict.items()}
+        
+        # Store targets with appropriate types
+        self.y_dict = {
+            'outcome': torch.LongTensor(y_dict['outcome']),  # Classification targets as Long
+            'home_score': torch.FloatTensor(y_dict['home_score']),  # Regression targets as Float
+            'away_score': torch.FloatTensor(y_dict['away_score'])
+        }
     
     def __len__(self):
         return len(self.X)
@@ -34,8 +49,11 @@ class MultiTaskNHLModel(nn.Module):
                  input_dim: int,
                  shared_layers: List[int] = [512, 256, 128],
                  task_heads: Dict[str, List[int]] = None,
-                 dropout: float = 0.3):
+                 dropout: float = 0.3,
+                 use_log_scores: bool = False):
         super(MultiTaskNHLModel, self).__init__()
+        
+        self.use_log_scores = use_log_scores
         
         if task_heads is None:
             task_heads = {
@@ -88,8 +106,15 @@ class MultiTaskNHLModel(nn.Module):
         
         # Task-specific predictions
         outcome_logits = self.outcome_head(shared_repr)  # 3 classes: home win, away win, OT
-        home_score = torch.relu(self.home_score_head(shared_repr))  # Non-negative
-        away_score = torch.relu(self.away_score_head(shared_repr))
+        
+        if self.use_log_scores:
+            # Output log-rates for Poisson loss with log_input=True
+            home_score = self.home_score_head(shared_repr)
+            away_score = self.away_score_head(shared_repr)
+        else:
+            # Output non-negative rates for standard Poisson or MSE
+            home_score = torch.relu(self.home_score_head(shared_repr))
+            away_score = torch.relu(self.away_score_head(shared_repr))
         
         return {
             'outcome': outcome_logits,
@@ -99,18 +124,22 @@ class MultiTaskNHLModel(nn.Module):
 
 
 class MultiTaskTrainer:
-    """Trainer for multi-task NHL model with GPU support"""
+    """Trainer for multi-task NHL model with GPU support and flexible loss functions"""
     
     def __init__(self,
                  model: nn.Module,
                  device: str = 'cuda' if torch.cuda.is_available() else 'cpu',
                  learning_rate: float = 0.001,
                  weight_decay: float = 0.0001,
-                 task_weights: Optional[Dict[str, float]] = None):
+                 task_weights: Optional[Dict[str, float]] = None,
+                 score_loss_type: ScoreLossType = ScoreLossType.MSE,
+                 hybrid_alpha: float = 0.7):
         
         self.model = model.to(device)
         self.device = device
         self.scaler = StandardScaler()
+        self.score_loss_type = score_loss_type
+        self.hybrid_alpha = hybrid_alpha  # Weight for MSE in hybrid loss
         
         # Default task weights
         if task_weights is None:
@@ -137,7 +166,13 @@ class MultiTaskTrainer:
         
         # Loss functions
         self.outcome_criterion = nn.CrossEntropyLoss()
-        self.score_criterion = nn.MSELoss()
+        
+        # Score loss functions
+        self.mse_criterion = nn.MSELoss()
+        if model.use_log_scores:
+            self.poisson_criterion = nn.PoissonNLLLoss(log_input=True, full=False)
+        else:
+            self.poisson_criterion = nn.PoissonNLLLoss(log_input=False, full=False)
         
         # For mixed precision training
         self.scaler_amp = torch.cuda.amp.GradScaler()
@@ -146,33 +181,80 @@ class MultiTaskTrainer:
             'train_loss': [],
             'val_loss': [],
             'train_outcome_loss': [],
-            'train_score_loss': []
+            'train_score_loss': [],
+            'train_mse_loss': [],
+            'train_poisson_loss': []
         }
         
         logger.info(f"Model initialized on {device}")
+        logger.info(f"Score loss type: {score_loss_type.value}")
     
     def compute_loss(self, predictions: Dict[str, torch.Tensor], targets: Dict[str, torch.Tensor]) -> Tuple[torch.Tensor, Dict]:
-        """Compute multi-task loss"""
+        """Compute multi-task loss with flexible score loss"""
         
-        # Outcome loss (classification)
-        outcome_loss = self.outcome_criterion(predictions['outcome'], targets['outcome'].long())
+        # Outcome loss (classification) - no longer needs .long() cast
+        outcome_loss = self.outcome_criterion(predictions['outcome'], targets['outcome'])
         
-        # Score losses (regression with Poisson-like characteristics)
-        home_score_loss = self.score_criterion(predictions['home_score'], targets['home_score'])
-        away_score_loss = self.score_criterion(predictions['away_score'], targets['away_score'])
-        score_loss = (home_score_loss + away_score_loss) / 2
+        # Score losses - choose based on loss type
+        if self.score_loss_type == ScoreLossType.MSE:
+            # Standard MSE loss
+            if self.model.use_log_scores:
+                # Convert log predictions back to actual scores for MSE
+                home_pred = torch.exp(predictions['home_score'])
+                away_pred = torch.exp(predictions['away_score'])
+            else:
+                home_pred = predictions['home_score']
+                away_pred = predictions['away_score']
+            
+            home_score_loss = self.mse_criterion(home_pred, targets['home_score'])
+            away_score_loss = self.mse_criterion(away_pred, targets['away_score'])
+            score_loss = (home_score_loss + away_score_loss) / 2
+            mse_loss = score_loss
+            poisson_loss = torch.tensor(0.0)
+            
+        elif self.score_loss_type == ScoreLossType.POISSON:
+            # Pure Poisson NLL loss
+            home_score_loss = self.poisson_criterion(predictions['home_score'], targets['home_score'])
+            away_score_loss = self.poisson_criterion(predictions['away_score'], targets['away_score'])
+            score_loss = (home_score_loss + away_score_loss) / 2
+            poisson_loss = score_loss
+            mse_loss = torch.tensor(0.0)
+            
+        else:  # HYBRID
+            # Hybrid: combine MSE and Poisson
+            # MSE component
+            if self.model.use_log_scores:
+                home_pred = torch.exp(predictions['home_score'])
+                away_pred = torch.exp(predictions['away_score'])
+            else:
+                home_pred = predictions['home_score']
+                away_pred = predictions['away_score']
+            
+            mse_home = self.mse_criterion(home_pred, targets['home_score'])
+            mse_away = self.mse_criterion(away_pred, targets['away_score'])
+            mse_loss = (mse_home + mse_away) / 2
+            
+            # Poisson component
+            poisson_home = self.poisson_criterion(predictions['home_score'], targets['home_score'])
+            poisson_away = self.poisson_criterion(predictions['away_score'], targets['away_score'])
+            poisson_loss = (poisson_home + poisson_away) / 2
+            
+            # Combined score loss
+            score_loss = self.hybrid_alpha * mse_loss + (1 - self.hybrid_alpha) * poisson_loss
         
         # Combined weighted loss
         total_loss = (
             self.task_weights['outcome'] * outcome_loss +
-            self.task_weights['home_score'] * home_score_loss +
-            self.task_weights['away_score'] * away_score_loss
+            self.task_weights['home_score'] * score_loss / 2 +
+            self.task_weights['away_score'] * score_loss / 2
         )
         
         loss_dict = {
             'total': total_loss.item(),
             'outcome': outcome_loss.item(),
-            'score': score_loss.item()
+            'score': score_loss.item(),
+            'mse': mse_loss.item() if isinstance(mse_loss, torch.Tensor) else mse_loss,
+            'poisson': poisson_loss.item() if isinstance(poisson_loss, torch.Tensor) else poisson_loss
         }
         
         return total_loss, loss_dict
@@ -180,7 +262,7 @@ class MultiTaskTrainer:
     def train_epoch(self, dataloader: DataLoader, use_amp: bool = True) -> Dict[str, float]:
         """Train for one epoch"""
         self.model.train()
-        epoch_losses = {'total': 0, 'outcome': 0, 'score': 0}
+        epoch_losses = {'total': 0, 'outcome': 0, 'score': 0, 'mse': 0, 'poisson': 0}
         
         for batch_idx, (X_batch, y_batch) in enumerate(dataloader):
             X_batch = X_batch.to(self.device)
@@ -214,7 +296,7 @@ class MultiTaskTrainer:
     def validate(self, dataloader: DataLoader) -> Dict[str, float]:
         """Validate model"""
         self.model.eval()
-        val_losses = {'total': 0, 'outcome': 0, 'score': 0}
+        val_losses = {'total': 0, 'outcome': 0, 'score': 0, 'mse': 0, 'poisson': 0}
         
         with torch.no_grad():
             for X_batch, y_batch in dataloader:
@@ -304,14 +386,26 @@ class MultiTaskTrainer:
                     logger.info(f"Early stopping at epoch {epoch}")
                     break
                 
-                logger.info(f"Epoch {epoch+1}/{epochs} - Train Loss: {train_losses['total']:.4f}, Val Loss: {val_losses['total']:.4f}")
+                logger.info(
+                    f"Epoch {epoch+1}/{epochs} - "
+                    f"Train Loss: {train_losses['total']:.4f} "
+                    f"(Outcome: {train_losses['outcome']:.4f}, Score: {train_losses['score']:.4f}, "
+                    f"MSE: {train_losses['mse']:.4f}, Poisson: {train_losses['poisson']:.4f}) - "
+                    f"Val Loss: {val_losses['total']:.4f}"
+                )
             else:
-                logger.info(f"Epoch {epoch+1}/{epochs} - Train Loss: {train_losses['total']:.4f}")
+                logger.info(
+                    f"Epoch {epoch+1}/{epochs} - "
+                    f"Train Loss: {train_losses['total']:.4f} "
+                    f"(Outcome: {train_losses['outcome']:.4f}, Score: {train_losses['score']:.4f})"
+                )
             
             # Update history
             self.history['train_loss'].append(train_losses['total'])
             self.history['train_outcome_loss'].append(train_losses['outcome'])
             self.history['train_score_loss'].append(train_losses['score'])
+            self.history['train_mse_loss'].append(train_losses['mse'])
+            self.history['train_poisson_loss'].append(train_losses['poisson'])
             
             # Step scheduler
             self.scheduler.step()
@@ -338,9 +432,17 @@ class MultiTaskTrainer:
                 # Convert outcome to probabilities
                 outcome_probs = torch.softmax(pred['outcome'], dim=1)
                 
+                # Convert log-scores back to actual scores if needed
+                if self.model.use_log_scores:
+                    home_scores = torch.exp(pred['home_score'])
+                    away_scores = torch.exp(pred['away_score'])
+                else:
+                    home_scores = pred['home_score']
+                    away_scores = pred['away_score']
+                
                 predictions['outcome'].append(outcome_probs.cpu().numpy())
-                predictions['home_score'].append(pred['home_score'].cpu().numpy())
-                predictions['away_score'].append(pred['away_score'].cpu().numpy())
+                predictions['home_score'].append(home_scores.cpu().numpy())
+                predictions['away_score'].append(away_scores.cpu().numpy())
         
         return {
             'outcome': np.vstack(predictions['outcome']),
@@ -354,7 +456,9 @@ class MultiTaskTrainer:
             'model_state_dict': self.model.state_dict(),
             'optimizer_state_dict': self.optimizer.state_dict(),
             'scaler_state_dict': self.scaler_amp.state_dict(),
-            'history': self.history
+            'history': self.history,
+            'score_loss_type': self.score_loss_type.value,
+            'use_log_scores': self.model.use_log_scores
         }, filepath)
         logger.info(f"Checkpoint saved to {filepath}")
     

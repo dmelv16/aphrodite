@@ -3,6 +3,7 @@ import pyodbc
 from typing import Dict, List, Optional, Tuple
 import logging
 from datetime import datetime, timedelta
+import numpy as np
 
 logger = logging.getLogger(__name__)
 
@@ -29,7 +30,7 @@ class NHLDataLoader:
             logger.info("Database connection closed")
     
     def load_schedule(self, 
-                     start_season: int = 20182019,
+                     start_season: int = 20092010,
                      end_season: int = 20242025,
                      game_types: List[int] = [2]) -> pd.DataFrame:
         """
@@ -158,7 +159,7 @@ class NHLDataLoader:
         return df
     
     def load_all_for_modeling(self, 
-                              start_season: int = 20182019,
+                              start_season: int = 20092010,
                               end_season: int = 20242025) -> Dict[str, pd.DataFrame]:
         """Load all tables needed for modeling"""
         logger.info(f"Loading all data from season {start_season} to {end_season}")
@@ -244,3 +245,50 @@ class DataCache:
         """Check if cache exists"""
         import os
         return os.path.exists(f"{self.cache_dir}/{name}.parquet")
+
+
+class TargetEncoder:
+    """Encode targets for multi-task learning with proper types"""
+    
+    def __init__(self):
+        self.outcome_mapping = {
+            'home_win': 0,
+            'away_win': 1,
+            'overtime': 2  # Could be OT or shootout
+        }
+    
+    def encode_targets(self, schedule_df: pd.DataFrame) -> Dict[str, np.ndarray]:
+        """
+        Encode game outcomes and scores
+        
+        Returns:
+            Dictionary with properly typed arrays:
+            - 'outcome': int64 (class indices)
+            - 'home_score': float32 (goal counts)
+            - 'away_score': float32 (goal counts)
+        """
+        outcomes = []
+        
+        for _, row in schedule_df.iterrows():
+            home_score = row['homeTeam_score']
+            away_score = row['awayTeam_score']
+            
+            # Determine outcome
+            if home_score > away_score:
+                outcomes.append(self.outcome_mapping['home_win'])
+            elif away_score > home_score:
+                outcomes.append(self.outcome_mapping['away_win'])
+            else:
+                # Tie shouldn't happen in modern NHL, but could be OT/SO
+                outcomes.append(self.outcome_mapping['overtime'])
+        
+        return {
+            'outcome': np.array(outcomes, dtype=np.int64),
+            'home_score': schedule_df['homeTeam_score'].values.astype(np.float32),
+            'away_score': schedule_df['awayTeam_score'].values.astype(np.float32)
+        }
+    
+    def decode_outcome(self, outcome_idx: int) -> str:
+        """Convert outcome index back to string"""
+        reverse_mapping = {v: k for k, v in self.outcome_mapping.items()}
+        return reverse_mapping[outcome_idx]

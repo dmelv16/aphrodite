@@ -22,22 +22,22 @@ class TemporalFeatureEngine:
         
         for window in windows:
             for col in value_cols:
-                # Rolling mean
+                # Rolling mean - FIXED: added shift(1) to prevent data leakage
                 result_df[f'{col}_rolling_{window}'] = (
                     result_df.groupby(group_col)[col]
-                    .transform(lambda x: x.rolling(window, min_periods=1).mean())
+                    .transform(lambda x: x.rolling(window, min_periods=1).mean().shift(1))
                 )
                 
-                # Rolling std
+                # Rolling std - FIXED: added shift(1)
                 result_df[f'{col}_rolling_std_{window}'] = (
                     result_df.groupby(group_col)[col]
-                    .transform(lambda x: x.rolling(window, min_periods=2).std())
+                    .transform(lambda x: x.rolling(window, min_periods=2).std().shift(1))
                 )
                 
-                # Rolling trend (simple linear)
+                # Rolling trend - FIXED: added shift(1)
                 result_df[f'{col}_trend_{window}'] = (
                     result_df.groupby(group_col)[col]
-                    .transform(lambda x: self._calculate_trend(x, window))
+                    .transform(lambda x: self._calculate_trend(x, window).shift(1))
                 )
         
         return result_df
@@ -60,9 +60,10 @@ class TemporalFeatureEngine:
         result_df = df.copy()
         
         for col in value_cols:
+            # FIXED: added shift(1) to prevent data leakage
             result_df[f'{col}_ema'] = (
                 result_df.groupby(group_col)[col]
-                .transform(lambda x: x.ewm(alpha=alpha, adjust=False).mean())
+                .transform(lambda x: x.ewm(alpha=alpha, adjust=False).mean().shift(1))
             )
         
         return result_df
@@ -71,22 +72,22 @@ class TemporalFeatureEngine:
         """Calculate team form indicators (streaks, momentum)"""
         result_df = df.copy()
         
-        # Win streak (positive = wins, negative = losses)
+        # Win streak - FIXED: shift applied in _calculate_streak
         result_df['win_streak'] = (
             result_df.groupby('team_id')['won']
             .transform(lambda x: self._calculate_streak(x))
         )
         
-        # Points in last 5 games (2 for win, 1 for OT loss, 0 for regulation loss)
+        # Points in last 5 games - FIXED: added shift(1)
         result_df['points_last_5'] = (
             result_df.groupby('team_id')['points']
-            .transform(lambda x: x.rolling(5, min_periods=1).sum())
+            .transform(lambda x: x.rolling(5, min_periods=1).sum().shift(1))
         )
         
-        # Hot hand indicator (goals scored above average in last 3 games)
+        # Hot hand indicator - FIXED: added shift(1)
         result_df['hot_hand'] = (
             result_df.groupby('team_id')['goals_for']
-            .transform(lambda x: (x.rolling(3).mean() - x.expanding().mean()).fillna(0))
+            .transform(lambda x: (x.rolling(3).mean().shift(1) - x.expanding().mean().shift(1)).fillna(0))
         )
         
         return result_df
@@ -97,16 +98,16 @@ class TemporalFeatureEngine:
         current_streak = 0
         
         for val in series:
+            # Store PREVIOUS streak before updating with current game
+            streaks.append(current_streak)
+            
             if pd.isna(val):
-                streaks.append(current_streak)
                 continue
                 
             if val == 1:  # Win
                 current_streak = current_streak + 1 if current_streak >= 0 else 1
             else:  # Loss
                 current_streak = current_streak - 1 if current_streak <= 0 else -1
-            
-            streaks.append(current_streak)
         
         return pd.Series(streaks, index=series.index)
     
@@ -114,6 +115,7 @@ class TemporalFeatureEngine:
         """Calculate days of rest between games"""
         result_df = df.copy()
         
+        # This is already correct - diff() naturally looks at previous row
         result_df['rest_days'] = (
             result_df.groupby('team_id')['gameDate']
             .diff()
@@ -130,49 +132,69 @@ class TemporalFeatureEngine:
         return result_df
     
     def calculate_schedule_density(self, df: pd.DataFrame, window: int = 10) -> pd.DataFrame:
-        """Calculate games played in last N days"""
+        """Calculate games played in last N days (OPTIMIZED: vectorized approach)"""
         result_df = df.copy()
         
-        result_df[f'games_in_{window}_days'] = (
-            result_df.groupby('team_id')['gameDate']
-            .transform(lambda x: self._count_games_in_window(x, window))
+        # Store original index
+        original_index = result_df.index
+        
+        # Set date as index for time-based rolling
+        result_df = result_df.set_index('gameDate')
+        
+        # Create a dummy column to count
+        result_df['game_count'] = 1
+        
+        # Group by team, roll over the date index, and count
+        # shift(1) ensures we only count games BEFORE the current game
+        col_name = f'games_in_{window}_days'
+        result_df[col_name] = (
+            result_df.groupby('team_id')['game_count']
+            .rolling(f'{window}D')
+            .count()
+            .shift(1)
+            .reset_index(0, drop=True)  # Drop the team_id level from the index
         )
         
+        # Restore original index and fill NaNs
+        result_df = result_df.reset_index().set_index(original_index).sort_index()
+        result_df[col_name] = result_df[col_name].fillna(0)  # Fill NaNs (e.g., first games)
+        del result_df['game_count']
+        
         return result_df
-    
-    def _count_games_in_window(self, dates: pd.Series, window: int) -> pd.Series:
-        """Count games in rolling date window"""
-        counts = []
-        for i, date in enumerate(dates):
-            cutoff = date - timedelta(days=window)
-            count = ((dates[:i] >= cutoff) & (dates[:i] < date)).sum()
-            counts.append(count)
-        return pd.Series(counts, index=dates.index)
     
     def calculate_home_away_splits(self, df: pd.DataFrame, windows: List[int] = [10, 20]) -> pd.DataFrame:
         """Calculate separate rolling stats for home and away games"""
         result_df = df.copy()
         
         for window in windows:
+            # FIXED: added shift(1) to both home and away calculations
             # Home performance
-            result_df[f'home_win_pct_{window}'] = (
-                result_df[result_df['is_home'] == 1]
+            home_mask = result_df['is_home'] == 1
+            result_df.loc[home_mask, f'home_win_pct_{window}'] = (
+                result_df[home_mask]
                 .groupby('team_id')['won']
-                .transform(lambda x: x.rolling(window, min_periods=1).mean())
+                .transform(lambda x: x.rolling(window, min_periods=1).mean().shift(1))
             )
             
             # Away performance
-            result_df[f'away_win_pct_{window}'] = (
-                result_df[result_df['is_home'] == 0]
+            away_mask = result_df['is_home'] == 0
+            result_df.loc[away_mask, f'away_win_pct_{window}'] = (
+                result_df[away_mask]
                 .groupby('team_id')['won']
-                .transform(lambda x: x.rolling(window, min_periods=1).mean())
+                .transform(lambda x: x.rolling(window, min_periods=1).mean().shift(1))
             )
             
-            # Fill missing values
-            result_df[f'home_win_pct_{window}'].fillna(method='ffill', inplace=True)
-            result_df[f'away_win_pct_{window}'].fillna(0.5, inplace=True)
-            result_df[f'away_win_pct_{window}'].fillna(method='ffill', inplace=True)
-            result_df[f'home_win_pct_{window}'].fillna(0.5, inplace=True)
+            # Fill missing values with forward fill, then default
+            result_df[f'home_win_pct_{window}'] = (
+                result_df.groupby('team_id')[f'home_win_pct_{window}']
+                .fillna(method='ffill')
+                .fillna(0.5)
+            )
+            result_df[f'away_win_pct_{window}'] = (
+                result_df.groupby('team_id')[f'away_win_pct_{window}']
+                .fillna(method='ffill')
+                .fillna(0.5)
+            )
         
         return result_df
     
@@ -180,7 +202,7 @@ class TemporalFeatureEngine:
         """Features related to season progression"""
         result_df = df.copy()
         
-        # Games played in season
+        # Games played in season (this is fine - cumcount is inherently "up to but not including")
         result_df['games_played_season'] = (
             result_df.groupby(['team_id', 'season'])
             .cumcount() + 1
@@ -189,13 +211,13 @@ class TemporalFeatureEngine:
         # Season progress percentage (assuming 82 games)
         result_df['season_progress'] = result_df['games_played_season'] / 82.0
         
-        # Month of season
+        # Month of season (this is fine - it's a property of the game date itself)
         result_df['month'] = result_df['gameDate'].dt.month
         
-        # Day of week (potential effect)
+        # Day of week (this is fine - it's a property of the game date itself)
         result_df['day_of_week'] = result_df['gameDate'].dt.dayofweek
         
-        # Season phase (early, mid, late, playoff_push)
+        # Season phase
         result_df['season_phase'] = pd.cut(
             result_df['season_progress'],
             bins=[0, 0.25, 0.5, 0.75, 1.0],
@@ -208,23 +230,57 @@ class TemporalFeatureEngine:
         """Calculate momentum and performance trajectory"""
         result_df = df.copy()
         
+        # FIXED: added shift(1) to all momentum calculations
         # Goal differential momentum
         result_df['gd_momentum'] = (
             result_df.groupby('team_id')['goal_differential']
-            .transform(lambda x: x.rolling(5).mean() - x.rolling(15).mean())
+            .transform(lambda x: (x.rolling(5).mean() - x.rolling(15).mean()).shift(1))
         )
         
         # Recent vs longer-term performance
         result_df['recent_vs_longterm'] = (
             result_df.groupby('team_id')['points']
-            .transform(lambda x: x.rolling(5).mean() - x.rolling(20).mean())
+            .transform(lambda x: (x.rolling(5).mean() - x.rolling(20).mean()).shift(1))
         )
         
         # Acceleration (improving or declining)
         result_df['performance_acceleration'] = (
             result_df.groupby('team_id')['points']
-            .transform(lambda x: x.rolling(3).mean() - x.rolling(3).mean().shift(3))
+            .transform(lambda x: (x.rolling(3).mean() - x.rolling(3).mean().shift(3)).shift(1))
         )
+        
+        return result_df
+    
+    def calculate_rolling_correlations(self, 
+                                       df: pd.DataFrame,
+                                       col1: str,
+                                       col2: str,
+                                       window: int = 10) -> pd.Series:
+        """Calculate rolling correlation between two metrics"""
+        # FIXED: Added shift(1) to prevent data leakage
+        return (
+            df.groupby('team_id')
+            .apply(lambda x: x[col1].rolling(window).corr(x[col2]).shift(1))
+            .reset_index(level=0, drop=True)
+        )
+    
+    def calculate_consistency_metrics(self, df: pd.DataFrame, windows: List[int] = [5, 10]) -> pd.DataFrame:
+        """Calculate team consistency/volatility metrics"""
+        result_df = df.copy()
+        
+        for window in windows:
+            # FIXED: Added shift(1) to prevent data leakage
+            # Goal scoring consistency (coefficient of variation)
+            result_df[f'goal_scoring_cv_{window}'] = (
+                result_df.groupby('team_id')['goals_for']
+                .transform(lambda x: (x.rolling(window).std() / x.rolling(window).mean()).shift(1))
+            )
+            
+            # Performance consistency (points)
+            result_df[f'performance_consistency_{window}'] = (
+                result_df.groupby('team_id')['points']
+                .transform(lambda x: (1 / (1 + x.rolling(window).std())).shift(1))
+            )
         
         return result_df
     
@@ -237,8 +293,8 @@ class TemporalFeatureEngine:
         # Merge schedule with team stats
         df = schedule_df.merge(team_stats_df, on=['game_id', 'team_id'], how='left')
         
-        # Sort by team and date
-        df = df.sort_values(['team_id', 'gameDate'])
+        # CRITICAL: Sort by team and date before any temporal calculations
+        df = df.sort_values(['team_id', 'gameDate']).reset_index(drop=True)
         
         # Calculate all feature types
         stat_columns = ['goals_for', 'goals_against', 'xG_for', 'xG_against', 
@@ -252,6 +308,7 @@ class TemporalFeatureEngine:
         df = self.calculate_home_away_splits(df)
         df = self.calculate_season_progression(df)
         df = self.calculate_momentum_features(df)
+        df = self.calculate_consistency_metrics(df)
         
         logger.info(f"Generated {len(df.columns)} total features")
         return df
