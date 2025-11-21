@@ -46,7 +46,7 @@ class StackingEnsemble:
                     max_iter=1000,
                     random_state=42
                 )
-            elif self.task == 'classification':
+            elif self.task in ['classification', 'binary']:  # Fixed
                 self.meta_learner = LogisticRegression(
                     max_iter=1000,
                     random_state=42
@@ -65,8 +65,9 @@ class StackingEnsemble:
                     max_depth=3,
                     device='gpu'
                 )
-            elif self.task == 'classification':
+            elif self.task in ['classification', 'binary']:  # Fixed
                 self.meta_learner = lgb.LGBMClassifier(
+                    objective='binary',  # Added explicit objective
                     n_estimators=100,
                     learning_rate=0.05,
                     max_depth=3,
@@ -83,9 +84,9 @@ class StackingEnsemble:
         logger.info(f"Created meta-learner: {self.meta_learner_type}")
     
     def generate_meta_features(self,
-                              X: pd.DataFrame,
-                              y: np.ndarray,
-                              fit_base: bool = False) -> np.ndarray:
+                            X: pd.DataFrame,
+                            y: np.ndarray,
+                            fit_base: bool = False) -> np.ndarray:
         """
         Generate meta-features using out-of-fold predictions
         
@@ -103,14 +104,14 @@ class StackingEnsemble:
         if self.use_probas and self.task == 'multiclass':
             n_classes = 3
             meta_features = np.zeros((n_samples, n_models * n_classes))
-        elif self.use_probas and self.task == 'classification':
+        elif self.use_probas and self.task in ['classification', 'binary']:  # Fixed
             meta_features = np.zeros((n_samples, n_models))
         else:
             meta_features = np.zeros((n_samples, n_models))
         
         if fit_base:
             # Use K-Fold CV to generate out-of-fold predictions
-            if self.task in ['classification', 'multiclass']:
+            if self.task in ['classification', 'multiclass', 'binary']:  # Fixed
                 kf = StratifiedKFold(n_splits=self.cv_folds, shuffle=True, random_state=42)
             else:
                 kf = KFold(n_splits=self.cv_folds, shuffle=True, random_state=42)

@@ -291,7 +291,7 @@ class TemporalFeatureEngine:
         logger.info("Generating temporal features...")
         
         # Merge schedule with team stats
-        df = schedule_df.merge(team_stats_df, on=['game_id', 'team_id'], how='left')
+        df = team_stats_df.copy()
         
         # CRITICAL: Sort by team and date before any temporal calculations
         df = df.sort_values(['team_id', 'gameDate']).reset_index(drop=True)

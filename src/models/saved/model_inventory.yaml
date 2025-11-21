@@ -1,0 +1,10 @@
+models_saved:
+- xgboost_outcome
+- poisson_multitask
+- lightgbm_outcome
+- stacking_ensemble
+n_features: 422
+test_size: 3814
+timestamp: '2025-11-20T17:45:39.889913'
+train_size: 15256
+uses_poisson: true

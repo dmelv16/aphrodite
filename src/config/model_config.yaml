@@ -3,8 +3,8 @@ models:
   xgboost:
     enabled: true
     params:
-      tree_method: 'gpu_hist'
-      gpu_id: 0
+      tree_method: 'hist'  # Changed from 'gpu_hist'
+      device: 'cuda'  # Changed from 'gpu_id': 0
       max_depth: 8
       learning_rate: 0.03
       n_estimators: 1000

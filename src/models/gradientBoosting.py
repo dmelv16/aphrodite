@@ -24,11 +24,10 @@ class XGBoostModel:
         self.feature_names = None
         self.best_iteration = None
         
-        # Default parameters optimized for GPU
+        # Default parameters optimized for GPU (XGBoost 3.1+ compatible)
         self.params = {
-            'tree_method': 'gpu_hist',
-            'gpu_id': 0,
-            'predictor': 'gpu_predictor',
+            'tree_method': 'hist',  # Changed from 'gpu_hist' - auto-detects GPU
+            'device': 'cuda',  # Changed from 'gpu_id': 0
             'max_depth': 8,
             'learning_rate': 0.03,
             'n_estimators': 1000,
@@ -85,11 +84,15 @@ class XGBoostModel:
         # Training with callbacks
         evals_result = {}
         
+        # Remove n_estimators from params for xgb.train() call
+        train_params = self.params.copy()
+        num_boost_round = train_params.pop('n_estimators', 1000)
+        
         logger.info("Training XGBoost model on GPU...")
         self.model = xgb.train(
-            self.params,
+            train_params,
             dtrain,
-            num_boost_round=self.params.get('n_estimators', 1000),
+            num_boost_round=num_boost_round,
             evals=eval_list,
             evals_result=evals_result,
             early_stopping_rounds=early_stopping_rounds,
@@ -195,12 +198,16 @@ class XGBoostModel:
             Dictionary with mean and std of scores
         """
         # Create sklearn-compatible model
+        # Update params for sklearn API (uses device instead of gpu_id)
+        sklearn_params = self.params.copy()
+        sklearn_params.pop('n_estimators', None)  # Will be set separately
+        
         if self.task == 'classification':
-            model = xgb.XGBClassifier(**self.params)
+            model = xgb.XGBClassifier(n_estimators=self.params.get('n_estimators', 1000), **sklearn_params)
         elif self.task == 'multiclass':
-            model = xgb.XGBClassifier(**self.params)
+            model = xgb.XGBClassifier(n_estimators=self.params.get('n_estimators', 1000), **sklearn_params)
         else:
-            model = xgb.XGBRegressor(**self.params)
+            model = xgb.XGBRegressor(n_estimators=self.params.get('n_estimators', 1000), **sklearn_params)
         
         scores = cross_val_score(model, X, y, cv=cv, scoring=scoring, n_jobs=1)
         

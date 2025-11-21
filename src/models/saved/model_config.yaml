@@ -1,0 +1,103 @@
+ensemble:
+  cv_folds: 5
+  meta_learner: lightgbm
+  method: stacking
+  use_probas: true
+evaluation:
+  cv_strategy: time_series
+  metrics:
+  - accuracy
+  - log_loss
+  - brier_score
+  - roc_auc
+  - calibration_error
+  n_splits: 5
+  test_size_games: 500
+features:
+  advanced_metrics: true
+  embeddings:
+    player_dim: 32
+    team_dim: 16
+    venue_dim: 8
+  player_features: true
+  rolling_windows:
+  - 5
+  - 10
+  - 20
+  temporal_features: true
+models:
+  catboost:
+    enabled: true
+    params:
+      bootstrap_type: Bayesian
+      depth: 8
+      devices: '0'
+      iterations: 1000
+      l2_leaf_reg: 3
+      learning_rate: 0.03
+      subsample: 0.8
+      task_type: GPU
+  lightgbm:
+    enabled: true
+    params:
+      colsample_bytree: 0.8
+      device: gpu
+      gpu_device_id: 0
+      gpu_platform_id: 0
+      learning_rate: 0.03
+      min_child_samples: 20
+      n_estimators: 1000
+      num_leaves: 63
+      reg_alpha: 0.1
+      reg_lambda: 1.0
+      subsample: 0.8
+  multi_task:
+    dropout: 0.3
+    enabled: true
+    shared_layers:
+    - 512
+    - 256
+    - 128
+    task_heads:
+      away_score:
+      - 64
+      home_score:
+      - 64
+      outcome:
+      - 128
+      - 64
+  neural_network:
+    architecture: tabnet
+    enabled: true
+    params:
+      gamma: 1.5
+      mask_type: entmax
+      momentum: 0.3
+      n_a: 64
+      n_d: 64
+      n_independent: 2
+      n_shared: 2
+      n_steps: 5
+  xgboost:
+    enabled: true
+    params:
+      colsample_bytree: 0.8
+      device: cuda
+      early_stopping_rounds: 50
+      gamma: 0.1
+      learning_rate: 0.03
+      max_depth: 8
+      min_child_weight: 3
+      n_estimators: 1000
+      reg_alpha: 0.1
+      reg_lambda: 1.0
+      subsample: 0.8
+      tree_method: hist
+training:
+  batch_size: 1024
+  early_stopping_patience: 15
+  epochs: 100
+  gradient_accumulation: 4
+  learning_rate: 0.001
+  mixed_precision: true
+  weight_decay: 0.0001
