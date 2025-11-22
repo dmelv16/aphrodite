@@ -1,6 +1,6 @@
 """
-Quantitative Betting Engine
-Mathematical approach to optimal bet sizing without behavioral biases
+Quantitative Betting Engine - Professional Grade
+Mathematical approach to optimal bet sizing with hedge fund-level logic
 """
 
 import numpy as np
@@ -9,8 +9,10 @@ from typing import Dict, List, Optional, Tuple
 from dataclasses import dataclass
 from scipy import stats, optimize
 from scipy.interpolate import interp1d
+from sklearn.isotonic import IsotonicRegression
 import logging
 import warnings
+from datetime import datetime
 
 logger = logging.getLogger(__name__)
 
@@ -38,11 +40,11 @@ class BetPosition:
 
 class QuantitativeBettingEngine:
     """
-    Pure mathematical betting engine based on:
-    1. Empirical accuracy interpolation
-    2. Kelly Criterion with proper constraints
-    3. Correlation-based portfolio optimization
-    4. No behavioral adjustments or "intuition"
+    Professional mathematical betting engine based on:
+    1. Isotonic regression for monotonic calibration
+    2. Kelly Criterion with drawdown protection
+    3. Slate optimization for full-day portfolio construction
+    4. Correlation-based portfolio optimization
     """
     
     def __init__(self, 
@@ -51,7 +53,7 @@ class QuantitativeBettingEngine:
                  min_edge_threshold: float = 0.0,
                  calibration_file: str = 'src/models/saved/threshold_analysis.csv'):
         """
-        Initialize Quantitative Betting Engine
+        Initialize Professional Betting Engine
         
         Args:
             bankroll: Starting bankroll
@@ -60,13 +62,15 @@ class QuantitativeBettingEngine:
             calibration_file: Path to threshold_analysis.csv from main.py
         """
         self.bankroll = bankroll
+        self.starting_bankroll = bankroll  # For drawdown calculation
+        self.high_water_mark = bankroll    # Track peak bankroll
         self.max_portfolio_leverage = max_portfolio_leverage
         self.min_edge_threshold = min_edge_threshold
         
         # Load empirical threshold data from main.py calibration
         self.threshold_data = self._load_threshold_data(calibration_file)
         
-        # Create interpolation functions for smooth accuracy estimates
+        # Create interpolation functions with isotonic regression
         self.accuracy_interpolator = self._create_interpolators()
         
         # Portfolio tracking
@@ -74,6 +78,9 @@ class QuantitativeBettingEngine:
         
         # Correlation matrix (simplified - in production, calculate from historical data)
         self.correlation_matrix = self._initialize_correlation_matrix()
+        
+        # Performance tracking for circuit breaker
+        self.recent_results = []  # List of (timestamp, result, pnl)
         
     def _load_threshold_data(self, calibration_file: str = None) -> pd.DataFrame:
         """Load empirical accuracy data from calibration file or use defaults"""
@@ -90,16 +97,10 @@ class QuantitativeBettingEngine:
                     rename_map = {
                         'high_confidence_count': 'n_samples',
                         'coverage_pct': 'coverage',
-                        'high_conf_accuracy': 'accuracy'  # <--- FIX: Uses the Home+Away High Conf Metric
+                        'high_conf_accuracy': 'accuracy'  # Uses the Home+Away High Conf Metric
                     }                    
                     loaded_data = loaded_data.rename(columns=rename_map)
                     
-                    # If 'precision' was mapped to 'accuracy', we need to ensure we don't 
-                    # have a collision if 'accuracy' meant something else.
-                    # Ideally, drop the original 'accuracy' column first if it exists.
-                    if 'accuracy' in loaded_data.columns and 'precision' in rename_map:
-                         # Ensure we are using the mapped column, not the original 'accuracy'
-                         pass
                     # Validate required columns
                     required_cols = {'threshold', 'accuracy', 'precision', 'n_samples'}
                     if required_cols.issubset(set(loaded_data.columns)):
@@ -142,38 +143,33 @@ class QuantitativeBettingEngine:
         
         return data
     
-    def _create_interpolators(self) -> Dict[str, interp1d]:
-        """Create smooth interpolation functions for metrics"""
+    def _create_interpolators(self) -> Dict[str, any]:
+        """Create monotonic calibration using Isotonic Regression"""
         df = self.threshold_data
         
-        # Remove points with too few samples for reliable interpolation
-        reliable_data = df[df['n'] >= 100].copy()
+        # Remove points with too few samples for reliable calibration
+        reliable_data = df[df['n'] >= 30].copy()  # Lower threshold for more data points
         
-        interpolators = {
-            'accuracy': interp1d(
-                reliable_data['threshold'], 
-                reliable_data['accuracy'],
-                kind='cubic',
-                bounds_error=False,
-                fill_value=(reliable_data['accuracy'].iloc[0], reliable_data['accuracy'].iloc[-1])
-            ),
-            'std_error': interp1d(
-                reliable_data['threshold'],
-                reliable_data['std_error'],
-                kind='linear',
-                bounds_error=False,
-                fill_value=(reliable_data['std_error'].iloc[0], reliable_data['std_error'].iloc[-1])
-            ),
-            'samples': interp1d(
-                reliable_data['threshold'],
-                reliable_data['n'],
-                kind='linear',
-                bounds_error=False,
-                fill_value=(reliable_data['n'].iloc[0], 0)
-            )
+        # Fit Isotonic Regression (Enforces: Higher Prob >= Higher Accuracy)
+        iso_reg = IsotonicRegression(out_of_bounds='clip', increasing=True)
+        
+        # Fit on thresholds -> accuracies
+        # In production, fit on raw predictions vs outcomes for best results
+        iso_reg.fit(reliable_data['threshold'].values, reliable_data['accuracy'].values)
+        
+        # Keep linear interpolation for std_error as it's just a variance estimate
+        std_error_interp = interp1d(
+            reliable_data['threshold'], 
+            reliable_data['std_error'], 
+            kind='linear', 
+            bounds_error=False,
+            fill_value=(reliable_data['std_error'].iloc[0], reliable_data['std_error'].iloc[-1])
+        )
+        
+        return {
+            'accuracy': iso_reg,
+            'std_error': std_error_interp
         }
-        
-        return interpolators
     
     def _initialize_correlation_matrix(self) -> Dict[Tuple[str, str], float]:
         """
@@ -194,45 +190,36 @@ class QuantitativeBettingEngine:
         }
         return correlations
     
+    def _get_drawdown_multiplier(self) -> float:
+        """
+        Reduce aggression if we are in a drawdown (Circuit Breaker)
+        
+        This protects the bankroll during model drift or bad streaks
+        """
+        current_drawdown = 1 - (self.bankroll / self.high_water_mark)
+        
+        if current_drawdown > 0.20:
+            logger.warning(f"Major drawdown detected: {current_drawdown:.1%}. Reducing bet sizes to 25%")
+            return 0.25
+        elif current_drawdown > 0.10:
+            logger.info(f"Moderate drawdown detected: {current_drawdown:.1%}. Reducing bet sizes to 50%")
+            return 0.50
+        return 1.0
+    
     def get_empirical_accuracy(self, probability: float) -> Tuple[float, float]:
         """
-        Get CONTINUOUS empirical accuracy via interpolation between DISCRETE buckets
+        Get empirical accuracy using monotonic isotonic regression
         
-        This is the key innovation: main.py provides discrete points (0.65, 0.70, etc.)
-        but we interpolate smoothly between them for any probability value.
-        
-        Example:
-            main.py says: 0.65 threshold → 69.16% actual accuracy
-                         0.70 threshold → 70.37% actual accuracy
-            
-            If model predicts 0.67, we interpolate: ~69.64% accuracy
-        
-        Args:
-            probability: Model's predicted probability (e.g., 0.67)
-            
-        Returns:
-            (interpolated_accuracy, standard_error)
+        This ensures that higher probabilities ALWAYS map to higher or equal accuracies
         """
-        # Ensure probability is within interpolation range
+        # Ensure probability is within the data range
         prob_clipped = np.clip(probability, 
                               self.threshold_data['threshold'].min(),
                               self.threshold_data['threshold'].max())
         
-        # Use cubic interpolation for smooth accuracy curve
-        accuracy = float(self.accuracy_interpolator['accuracy'](prob_clipped))
+        # Use isotonic regression for monotonic accuracy
+        accuracy = float(self.accuracy_interpolator['accuracy'].predict([prob_clipped])[0])
         std_error = float(self.accuracy_interpolator['std_error'](prob_clipped))
-        
-        # Log the interpolation for transparency
-        if hasattr(self, '_debug_mode') and self._debug_mode:
-            # Find surrounding buckets
-            lower_bucket = self.threshold_data[self.threshold_data['threshold'] <= probability].iloc[-1] if len(self.threshold_data[self.threshold_data['threshold'] <= probability]) > 0 else None
-            upper_bucket = self.threshold_data[self.threshold_data['threshold'] > probability].iloc[0] if len(self.threshold_data[self.threshold_data['threshold'] > probability]) > 0 else None
-            
-            if lower_bucket is not None and upper_bucket is not None:
-                print(f"  Interpolating {probability:.3f} between:")
-                print(f"    {lower_bucket['threshold']:.2f} → {lower_bucket['accuracy']:.1%}")
-                print(f"    {upper_bucket['threshold']:.2f} → {upper_bucket['accuracy']:.1%}")
-                print(f"  Result: {accuracy:.1%}")
         
         return accuracy, std_error
     
@@ -241,16 +228,12 @@ class QuantitativeBettingEngine:
                                 decimal_odds: float,
                                 confidence_interval_width: float = 1.96) -> float:
         """
-        Calculate Kelly fraction with uncertainty adjustment
-        
-        Uses the Kelly formula: f = (bp - q) / b
-        Adjusts for model uncertainty using confidence intervals
+        Calculate Kelly fraction with uncertainty adjustment and drawdown protection
         """
         # Get empirical accuracy for this probability level
         empirical_accuracy, std_error = self.get_empirical_accuracy(win_probability)
         
         # Adjust probability based on empirical calibration
-        # If model says 65% but empirical accuracy at 65% is 69%, use 69%
         calibration_ratio = empirical_accuracy / win_probability if win_probability > 0 else 1.0
         adjusted_probability = min(0.99, win_probability * calibration_ratio)
         
@@ -270,13 +253,124 @@ class QuantitativeBettingEngine:
         kelly_fraction = (b * p - q) / b
         
         # Adjust for uncertainty (fractional Kelly based on confidence)
-        # Higher uncertainty = lower fraction
         uncertainty_penalty = 1 / (1 + confidence_interval_width * std_error)
         
         # Apply standard fractional Kelly (25% is common in practice)
         conservative_fraction = 0.25
         
-        return max(0, kelly_fraction * conservative_fraction * uncertainty_penalty)
+        # Apply drawdown circuit breaker
+        drawdown_mult = self._get_drawdown_multiplier()
+        
+        return max(0, kelly_fraction * conservative_fraction * uncertainty_penalty * drawdown_mult)
+    
+    def optimize_daily_slate(self, potential_bets: List[Dict]) -> List[Dict]:
+        """
+        Optimize a full day's slate of bets simultaneously.
+        Prevents 'first-mover advantage' where early games eat up all the leverage.
+        
+        This is crucial for NHL where you might have 10+ games in one day.
+        """
+        logger.info(f"Optimizing slate of {len(potential_bets)} potential bets")
+        
+        # 1. Calculate raw Kelly size for ALL bets first
+        for bet in potential_bets:
+            # Calculate raw metrics but don't finalize size
+            acc, std_err = self.get_empirical_accuracy(bet['model_probability'])
+            kelly = self.calculate_kelly_fraction(bet['model_probability'], bet['decimal_odds'])
+            bet['raw_kelly_size'] = kelly * self.bankroll
+            bet['edge'] = (acc * bet['decimal_odds']) - 1
+            bet['empirical_accuracy'] = acc
+            bet['std_error'] = std_err
+            
+            # Add expected value for prioritization
+            bet['expected_value'] = bet['edge'] * bet['raw_kelly_size']
+
+        # 2. Filter to viable bets only
+        viable_bets = [b for b in potential_bets if b['edge'] > self.min_edge_threshold]
+        
+        if not viable_bets:
+            logger.info("No viable bets found in slate")
+            return []
+        
+        # 3. Sort by expected value (best bets get priority)
+        viable_bets.sort(key=lambda x: x['expected_value'], reverse=True)
+        
+        # 4. Calculate Total Exposure Required
+        total_kelly_exposure = sum(b['raw_kelly_size'] for b in viable_bets)
+        max_daily_exposure = self.bankroll * self.max_portfolio_leverage
+        
+        logger.info(f"Total Kelly exposure: ${total_kelly_exposure:.2f}, Max allowed: ${max_daily_exposure:.2f}")
+        
+        # 5. Proportional Shrinkage (The "Portfolio" adjustment)
+        scaling_factor = 1.0
+        if total_kelly_exposure > max_daily_exposure:
+            scaling_factor = max_daily_exposure / total_kelly_exposure
+            logger.info(f"Oversubscribed slate. Scaling all bets by {scaling_factor:.2%}")
+
+        # 6. Finalize Decisions with correlation adjustments
+        final_decisions = []
+        cumulative_exposure = 0
+        
+        for bet in viable_bets:
+            # Calculate correlation with existing bets
+            temp_position = BetPosition(
+                game_id=bet['game_id'],
+                team=bet['team'],
+                bet_type=bet['bet_type'],
+                probability=bet['model_probability'],
+                decimal_odds=bet['decimal_odds'],
+                size=bet['raw_kelly_size'] * scaling_factor,
+                timestamp=bet.get('timestamp', datetime.now().timestamp())
+            )
+            
+            # Get positions already added to final_decisions
+            existing_positions = [
+                BetPosition(
+                    game_id=d['game_id'],
+                    team=d['team'],
+                    bet_type=d['bet_type'],
+                    probability=d['model_probability'],
+                    decimal_odds=d['decimal_odds'],
+                    size=d['bet_size'],
+                    timestamp=d.get('timestamp', datetime.now().timestamp())
+                )
+                for d in final_decisions
+            ]
+            
+            portfolio_correlation = self.calculate_portfolio_correlation(temp_position, existing_positions)
+            
+            # Apply correlation adjustment
+            correlation_adjustment = 1.0
+            if portfolio_correlation > 0.5:
+                correlation_adjustment = 1 / (1 + portfolio_correlation)
+            
+            final_size = bet['raw_kelly_size'] * scaling_factor * correlation_adjustment
+            
+            # Re-check minimums after all adjustments
+            if final_size >= 10 and cumulative_exposure + final_size <= max_daily_exposure:
+                decision = {
+                    'decision': 'BET',
+                    'bet_size': final_size,
+                    'bet_size_pct': final_size / self.bankroll * 100,
+                    'edge': bet['edge'],
+                    'model_probability': bet['model_probability'],
+                    'empirical_accuracy': bet['empirical_accuracy'],
+                    'accuracy_std_error': bet['std_error'],
+                    'implied_probability': 1 / bet['decimal_odds'],
+                    'decimal_odds': bet['decimal_odds'],
+                    'expected_value': bet['edge'] * final_size,
+                    'portfolio_correlation': portfolio_correlation,
+                    'game_id': bet['game_id'],
+                    'team': bet['team'],
+                    'bet_type': bet['bet_type'],
+                    'scaling_factor': scaling_factor,
+                    'timestamp': bet.get('timestamp', datetime.now().timestamp())
+                }
+                final_decisions.append(decision)
+                cumulative_exposure += final_size
+            
+        logger.info(f"Final slate: {len(final_decisions)} bets, total exposure: ${cumulative_exposure:.2f}")
+        return final_decisions
     
     def calculate_portfolio_correlation(self, 
                                        new_position: BetPosition,
@@ -388,9 +482,10 @@ class QuantitativeBettingEngine:
                              timestamp: Optional[float] = None) -> Dict:
         """
         Make optimal betting decision based on mathematical principles
+        
+        Note: Consider using optimize_daily_slate() for multiple games instead
         """
-        # 1. Calculate Empirical Accuracy IMMEDIATELY (Fixes UnboundLocalError)
-        # We calculate this first so it is available for all return paths (NO_BET or BET)
+        # 1. Calculate Empirical Accuracy IMMEDIATELY
         empirical_accuracy, std_error = self.get_empirical_accuracy(model_probability)
         
         # Calculate base Kelly size
@@ -408,7 +503,7 @@ class QuantitativeBettingEngine:
                 'reason': 'INSUFFICIENT_EDGE' if edge < self.min_edge_threshold else 'SIZE_TOO_SMALL',
                 'edge': edge,
                 'kelly_fraction': kelly_fraction,
-                'empirical_accuracy': empirical_accuracy, # Now safely defined
+                'empirical_accuracy': empirical_accuracy,
                 'model_probability': model_probability,
                 'implied_probability': implied_probability
             }
@@ -421,7 +516,7 @@ class QuantitativeBettingEngine:
             probability=model_probability,
             decimal_odds=decimal_odds,
             size=base_kelly_size,
-            timestamp=timestamp or 0
+            timestamp=timestamp or datetime.now().timestamp()
         )
         
         # Calculate portfolio metrics
@@ -443,7 +538,7 @@ class QuantitativeBettingEngine:
                 'edge': edge,
                 'kelly_fraction': kelly_fraction,
                 'portfolio_correlation': portfolio_correlation,
-                'empirical_accuracy': empirical_accuracy, # Added this (was missing!)
+                'empirical_accuracy': empirical_accuracy,
                 'model_probability': model_probability
             }
         
@@ -472,25 +567,47 @@ class QuantitativeBettingEngine:
             'bet_type': bet_type
         }
     
-    def update_portfolio(self, position: BetPosition, result: str):
+    def update_portfolio(self, position: BetPosition, result: str, pnl: Optional[float] = None):
         """
         Update portfolio after bet resolution
         
         Args:
             position: The bet position
             result: 'WIN', 'LOSS', or 'PUSH'
+            pnl: Optional profit/loss amount
         """
         # Remove from active positions
         self.active_positions = [p for p in self.active_positions 
                                 if not (p.game_id == position.game_id and 
                                       p.bet_type == position.bet_type)]
         
+        # Calculate P&L if not provided
+        if pnl is None:
+            if result == 'WIN':
+                pnl = position.size * (position.decimal_odds - 1)
+            elif result == 'LOSS':
+                pnl = -position.size
+            else:  # PUSH
+                pnl = 0
+        
         # Update bankroll
-        if result == 'WIN':
-            self.bankroll += position.size * (position.decimal_odds - 1)
-        elif result == 'LOSS':
-            self.bankroll -= position.size
-        # PUSH returns the bet
+        self.bankroll += pnl
+        
+        # Update high water mark
+        if self.bankroll > self.high_water_mark:
+            self.high_water_mark = self.bankroll
+        
+        # Track result for performance analysis
+        self.recent_results.append({
+            'timestamp': datetime.now(),
+            'result': result,
+            'pnl': pnl,
+            'bankroll': self.bankroll
+        })
+        
+        # Keep only last 100 results
+        if len(self.recent_results) > 100:
+            self.recent_results = self.recent_results[-100:]
     
     def get_portfolio_metrics(self) -> Dict:
         """
@@ -503,7 +620,10 @@ class QuantitativeBettingEngine:
                 'position_count': 0,
                 'avg_edge': 0,
                 'portfolio_expected_value': 0,
-                'portfolio_std_dev': 0
+                'portfolio_std_dev': 0,
+                'current_drawdown': 1 - (self.bankroll / self.high_water_mark),
+                'bankroll': self.bankroll,
+                'high_water_mark': self.high_water_mark
             }
         
         total_exposure = sum(p.size for p in self.active_positions)
@@ -529,5 +649,9 @@ class QuantitativeBettingEngine:
             'avg_edge': np.mean(edges),
             'portfolio_expected_value': portfolio_ev,
             'portfolio_std_dev': portfolio_std,
-            'portfolio_sharpe': portfolio_ev / portfolio_std if portfolio_std > 0 else 0
+            'portfolio_sharpe': portfolio_ev / portfolio_std if portfolio_std > 0 else 0,
+            'current_drawdown': 1 - (self.bankroll / self.high_water_mark),
+            'bankroll': self.bankroll,
+            'high_water_mark': self.high_water_mark,
+            'drawdown_multiplier': self._get_drawdown_multiplier()
         }
