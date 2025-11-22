@@ -15,15 +15,15 @@ from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_sc
 warnings.filterwarnings('ignore')
 
 # Import custom modules
-from data.loaders import NHLDataLoader, DataCache
-from features.temporal import TemporalFeatureEngine
-from features.advanced import AdvancedFeatureEngine
-from models.gradientBoosting import XGBoostModel, XGBoostEnsemble
-from models.poisson_neural import PoissonMultiTaskNHLModel, PoissonMultiTaskTrainer
-from models.stacking import StackingEnsemble
-from evaluation.metrics import ModelEvaluator
-from evaluation.improved_score_analyzer import ImprovedScorePredictionAnalyzer 
-from utils.gpu_utils import check_gpu_availability
+from src.data.loaders import NHLDataLoader, DataCache
+from src.features.temporal import TemporalFeatureEngine
+from src.features.advanced import AdvancedFeatureEngine
+from src.models.gradientBoosting import XGBoostModel, XGBoostEnsemble
+from src.models.poisson_neural import PoissonMultiTaskNHLModel, PoissonMultiTaskTrainer
+from src.models.stacking import StackingEnsemble
+from src.evaluation.metrics import ModelEvaluator
+from src.evaluation.improved_score_analyzer import ImprovedScorePredictionAnalyzer 
+from src.utils.gpu_utils import check_gpu_availability
 
 # Setup logging
 logging.basicConfig(
@@ -40,7 +40,7 @@ logger = logging.getLogger(__name__)
 class NHLPredictionPipeline:
     """Complete pipeline for NHL game prediction"""
     
-    def __init__(self, config_path: str = 'config/model_config.yaml'):
+    def __init__(self, config_path: str = 'src/config/model_config.yaml'):
         # Load configuration
         with open(config_path, 'r') as f:
             self.config = yaml.safe_load(f)
@@ -142,52 +142,44 @@ class NHLPredictionPipeline:
                 team_stats.append(away_stats)
         
         team_stats_df = pd.DataFrame(team_stats)
+
+        numeric_cols = [
+            'goals_for', 'goals_against', 'xG_for', 'xG_against', 
+            'shots_for', 'shots_against', 'shooting_percentage', 'save_percentage',
+            'won', 'points', 'goal_differential'
+        ]
+        
+        for col in numeric_cols:
+            if col in team_stats_df.columns:
+                team_stats_df[col] = pd.to_numeric(team_stats_df[col], errors='coerce').fillna(0)
+        
+        # 2. Sort strictly by Date/Team before calculating rolling features
+        # (Temporal engine does this, but safe to ensure here for the Ghost Row insertion later)
+        team_stats_df = team_stats_df.sort_values(['team_id', 'gameDate'])
         
         # Generate temporal features
         temporal_features = self.temporal_engine.generate_all_temporal_features(
             schedule, team_stats_df
         )
-        
-        # Generate advanced features
+
+        # Generate advanced features (already returns game-level with home_/away_ prefixes)
         advanced_features = self.advanced_engine.generate_all_advanced_features(
             schedule, shot_xg, team_game_xg, events
         )
-        
+
         # Merge all features at game level
         game_features = schedule[['game_id', 'season', 'gameDate', 'homeTeam_id', 'awayTeam_id', 
                                 'homeTeam_score', 'awayTeam_score']].copy()
-        
-        # FIXED: Merge temporal_features with schedule info to get homeTeam_id and awayTeam_id
-        temporal_with_game_info = temporal_features.merge(
-            schedule[['game_id', 'homeTeam_id', 'awayTeam_id']], 
-            on='game_id', 
-            how='left'
-        )
-        
-        # NOW filter for home and away teams
-        home_temporal = temporal_with_game_info[
-            temporal_with_game_info['team_id'] == temporal_with_game_info['homeTeam_id']
-        ]
-        away_temporal = temporal_with_game_info[
-            temporal_with_game_info['team_id'] == temporal_with_game_info['awayTeam_id']
-        ]
-        
-        # Rename columns to indicate home/away
-        home_cols = [c for c in home_temporal.columns 
-                    if c not in ['game_id', 'team_id', 'season', 'gameDate', 'homeTeam_id', 'awayTeam_id']]
-        away_cols = [c for c in away_temporal.columns 
-                    if c not in ['game_id', 'team_id', 'season', 'gameDate', 'homeTeam_id', 'awayTeam_id']]
-        
-        home_temporal_renamed = home_temporal[['game_id'] + home_cols].copy()
-        home_temporal_renamed.columns = ['game_id'] + [f'home_{c}' for c in home_cols]
-        
-        away_temporal_renamed = away_temporal[['game_id'] + away_cols].copy()
-        away_temporal_renamed.columns = ['game_id'] + [f'away_{c}' for c in away_cols]
-        
-        # Merge features
-        game_features = game_features.merge(home_temporal_renamed, on='game_id', how='left')
-        game_features = game_features.merge(away_temporal_renamed, on='game_id', how='left')
+
+        # Simple merge - no need to filter or rename!
+        game_features = game_features.merge(temporal_features, on='game_id', how='left')
         game_features = game_features.merge(advanced_features, on='game_id', how='left')
+
+        logger.info(f"  Shape before cleanup: {game_features.shape}")
+
+        game_features = consolidate_duplicate_features(game_features)
+        
+        logger.info(f"  Shape after cleanup: {game_features.shape}")
         
         # === CREATE PROPER OUTCOME LABELS ===
         # First, create basic win indicators
@@ -362,7 +354,6 @@ class NHLPredictionPipeline:
         
         # XGBoost model - BINARY classification
         logger.info("Training XGBoost classifier...")
-        from models.gradientBoosting import XGBoostModel
         
         xgb_model = XGBoostModel(
             task='binary',
@@ -441,7 +432,7 @@ class NHLPredictionPipeline:
         # ============================================================================
         threshold_df = analyze_prediction_thresholds(self.y_test_outcome, test_probs)
         print_threshold_analysis(threshold_df, logger)
-        save_threshold_analysis(threshold_df, output_dir='models/saved')
+        save_threshold_analysis(threshold_df, output_dir='src/models/saved')
         
         # Store threshold analysis for later use
         self.threshold_analysis = threshold_df
@@ -652,9 +643,6 @@ class NHLPredictionPipeline:
         self.models['lightgbm_outcome'] = lgb_model
         logger.info("  ✓ LightGBM model stored")
         
-        # Create stacking ensemble
-        from models.stacking import StackingEnsemble
-        
         stacking = StackingEnsemble(
             base_models=base_models,
             meta_learner='lightgbm',
@@ -702,7 +690,7 @@ class NHLPredictionPipeline:
         
         return stacking
         
-    def save_models(self, output_dir: str = 'models/saved'):
+    def save_models(self, output_dir: str = 'src/models/saved'):
         """
         UPDATED: Save models including Poisson model
         """
@@ -790,10 +778,10 @@ class NHLPredictionPipeline:
         self.train_level_1_outcome_classifier()
         
         # CHANGED: Train Poisson score prediction instead of regular NN
-        self.train_level_2_score_prediction_poisson()
+        # self.train_level_2_score_prediction_poisson()
         
-        # NEW: Analyze score predictions and find O/U edges
-        self.analyze_score_predictions()
+        # # NEW: Analyze score predictions and find O/U edges
+        # self.analyze_score_predictions()
         
         # Train ensemble (for outcome predictions)
         self.train_ensemble()
@@ -821,19 +809,19 @@ class NHLPredictionPipeline:
             logger.info(f"  Coverage: {best_threshold['coverage_pct']:.1f}% of games")
         
         # O/U betting
-        if hasattr(self, 'score_analyzer'):
-            edges_df = self.score_analyzer.find_betting_edges_improved()
-            if not edges_df.empty:
-                logger.info(f"\nOver/Under Betting:")
-                logger.info(f"  Opportunities found: {len(edges_df)}")
-                logger.info(f"  Average edge: {edges_df['edge'].mean():.3f}")
-                logger.info(f"  Expected ROI: {edges_df['roi'].mean():.3f}")
+        # if hasattr(self, 'score_analyzer'):
+        #     edges_df = self.score_analyzer.find_betting_edges_improved()
+        #     if not edges_df.empty:
+        #         logger.info(f"\nOver/Under Betting:")
+        #         logger.info(f"  Opportunities found: {len(edges_df)}")
+        #         logger.info(f"  Average edge: {edges_df['edge'].mean():.3f}")
+        #         logger.info(f"  Expected ROI: {edges_df['roi'].mean():.3f}")
                 
-                # Best edges by line
-                for line in edges_df['line'].unique():
-                    line_edges = edges_df[edges_df['line'] == line]
-                    logger.info(f"  Line {line}: {len(line_edges)} bets, "
-                              f"Win rate: {line_edges['hit'].mean():.3f}")
+        #         # Best edges by line
+        #         for line in edges_df['line'].unique():
+        #             line_edges = edges_df[edges_df['line'] == line]
+        #             logger.info(f"  Line {line}: {len(line_edges)} bets, "
+        #                       f"Win rate: {line_edges['hit'].mean():.3f}")
         
         logger.info("=" * 80)
 
@@ -1055,7 +1043,7 @@ def print_threshold_analysis(threshold_df, logger):
     logger.info("=" * 100 + "\n")
 
 
-def save_threshold_analysis(threshold_df, output_dir='models/saved'):
+def save_threshold_analysis(threshold_df, output_dir='src/models/saved'):
     """
     Save threshold analysis to CSV
     
@@ -1069,6 +1057,53 @@ def save_threshold_analysis(threshold_df, output_dir='models/saved'):
     output_path = f"{output_dir}/threshold_analysis.csv"
     threshold_df.to_csv(output_path, index=False)
     logger.info(f"Threshold analysis saved to {output_path}")
+
+def consolidate_duplicate_features(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Scans for _x and _y columns, checks for zeros, and merges them 
+    into a single standardized column.
+    """
+    # Identify all columns ending in _x
+    x_cols = [col for col in df.columns if col.endswith('_x')]
+    
+    logger.info(f"Found {len(x_cols)} duplicate feature pairs to consolidate...")
+    
+    for col_x in x_cols:
+        # Construct the corresponding _y name and base name
+        base_name = col_x[:-2]  # remove '_x'
+        col_y = base_name + '_y'
+        
+        if col_y in df.columns:
+            # Check if columns are effectively zero
+            # (We use a small threshold or exact 0 check)
+            is_x_empty = (df[col_x] == 0).all()
+            is_y_empty = (df[col_y] == 0).all()
+            
+            if is_x_empty and not is_y_empty:
+                # Case 1: X is empty, Y has data -> Keep Y
+                df[base_name] = df[col_y]
+                # logger.info(f"  {base_name}: Kept _y (source 2), dropped _x (empty)")
+                
+            elif is_y_empty and not is_x_empty:
+                # Case 2: Y is empty, X has data -> Keep X
+                df[base_name] = df[col_x]
+                # logger.info(f"  {base_name}: Kept _x (source 1), dropped _y (empty)")
+                
+            elif is_x_empty and is_y_empty:
+                # Case 3: Both are empty -> Keep 0s
+                df[base_name] = 0
+                # logger.info(f"  {base_name}: Both empty, keeping 0s")
+                
+            else:
+                # Case 4: Both have data (Conflict) -> Take the Max (or Mean)
+                # Usually max is safer if one source might be missing data points
+                df[base_name] = df[[col_x, col_y]].max(axis=1)
+                # logger.info(f"  {base_name}: Merged _x and _y (max value)")
+            
+            # Drop the original _x and _y columns
+            df.drop(columns=[col_x, col_y], inplace=True)
+            
+    return df
 
 def main():
     """Main execution function"""

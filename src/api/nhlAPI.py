@@ -58,10 +58,8 @@ class NHLCurrentSeasonScraper:
             'penaltykill': 'penaltykill',
             'penaltyShots': 'penaltyShots',
             'powerplay': 'powerplay',
-            'puckPossessions': 'puckPossessions',
             'summaryshooting': 'summaryshooting',
             'percentages': 'percentages',
-            'scoringRates': 'scoringRates',
             'scoringpergame': 'scoringpergame',
             'shootout': 'shootout',
             'shottype': 'shottype',
@@ -464,33 +462,42 @@ class NHLCurrentSeasonScraper:
                             game_state = game.get('gameState', '')
                             
                             if game_state == 'OFF':  # Only finished games
+                                # Extract nested values explicitly
+                                venue_data = game.get('venue', {})
+                                if isinstance(venue_data, dict):
+                                    venue_value = venue_data.get('default', '')
+                                else:
+                                    venue_value = venue_data
+                                
+                                # Get away and home team data
+                                away_team = game.get('awayTeam', {})
+                                home_team = game.get('homeTeam', {})
+                                
+                                # Build game record matching your database schema exactly
                                 game_record = {
                                     'game_id': game.get('id'),
                                     'season': game.get('season'),
                                     'gameType': game.get('gameType'),
                                     'gameDate': date_str,
-                                    'venue': game.get('venue', {}).get('default'),
+                                    'venue': venue_value,
                                     'neutralSite': game.get('neutralSite'),
                                     'startTimeUTC': game.get('startTimeUTC'),
                                     'gameState': game_state,
                                     'gameScheduleState': game.get('gameScheduleState'),
                                     
-                                    # Away team info
-                                    'awayTeam_id': game.get('awayTeam', {}).get('id'),
-                                    'awayTeam_abbrev': game.get('awayTeam', {}).get('abbrev'),
-                                    'awayTeam_placeName_default': game.get('awayTeam', {}).get('placeName', {}).get('default'),
-                                    'awayTeam_score': game.get('awayTeam', {}).get('score'),
-                                    'awayTeam_logo': game.get('awayTeam', {}).get('logo'),
+                                    # Away team info (NO placeName)
+                                    'awayTeam_id': away_team.get('id'),
+                                    'awayTeam_abbrev': away_team.get('abbrev'),
+                                    'awayTeam_score': away_team.get('score'),
+                                    'awayTeam_logo': away_team.get('logo'),
                                     
-                                    # Home team info
-                                    'homeTeam_id': game.get('homeTeam', {}).get('id'),
-                                    'homeTeam_abbrev': game.get('homeTeam', {}).get('abbrev'),
-                                    'homeTeam_placeName_default': game.get('homeTeam', {}).get('placeName', {}).get('default'),
-                                    'homeTeam_score': game.get('homeTeam', {}).get('score'),
-                                    'homeTeam_logo': game.get('homeTeam', {}).get('logo'),
+                                    # Home team info (NO placeName)
+                                    'homeTeam_id': home_team.get('id'),
+                                    'homeTeam_abbrev': home_team.get('abbrev'),
+                                    'homeTeam_score': home_team.get('score'),
+                                    'homeTeam_logo': home_team.get('logo'),
                                     
                                     # Store full JSON for complex fields
-                                    'venue_default': game.get('venue', {}).get('default'),
                                     'tvBroadcasts_json': json.dumps(game.get('tvBroadcasts', [])),
                                     'periodDescriptor_json': json.dumps(game.get('periodDescriptor', {})),
                                     'gameOutcome_json': json.dumps(game.get('gameOutcome', {})),

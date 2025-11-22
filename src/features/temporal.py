@@ -285,12 +285,12 @@ class TemporalFeatureEngine:
         return result_df
     
     def generate_all_temporal_features(self, 
-                                       schedule_df: pd.DataFrame,
-                                       team_stats_df: pd.DataFrame) -> pd.DataFrame:
+                                    schedule_df: pd.DataFrame,
+                                    team_stats_df: pd.DataFrame) -> pd.DataFrame:
         """Generate all temporal features"""
         logger.info("Generating temporal features...")
         
-        # Merge schedule with team stats
+        # Work with team stats
         df = team_stats_df.copy()
         
         # CRITICAL: Sort by team and date before any temporal calculations
@@ -298,7 +298,7 @@ class TemporalFeatureEngine:
         
         # Calculate all feature types
         stat_columns = ['goals_for', 'goals_against', 'xG_for', 'xG_against', 
-                       'shots_for', 'shots_against', 'shooting_percentage', 'save_percentage']
+                    'shots_for', 'shots_against', 'shooting_percentage', 'save_percentage']
         
         df = self.calculate_rolling_stats(df, 'team_id', stat_columns, self.windows)
         df = self.calculate_exponential_moving_average(df, 'team_id', stat_columns)
@@ -310,5 +310,38 @@ class TemporalFeatureEngine:
         df = self.calculate_momentum_features(df)
         df = self.calculate_consistency_metrics(df)
         
-        logger.info(f"Generated {len(df.columns)} total features")
-        return df
+        # NOW merge with schedule properly
+        temporal_df = schedule_df[['game_id', 'homeTeam_id', 'awayTeam_id']].copy()
+
+        # Get feature columns (everything except game_id, team_id)
+        feature_cols = [c for c in df.columns if c not in ['game_id', 'team_id']]
+
+        # Merge home team features (no filtering - let merge handle it)
+        home_features = df[['game_id', 'team_id'] + feature_cols].copy()
+        home_features.columns = ['game_id', 'team_id'] + ['home_' + c for c in feature_cols]
+
+        temporal_df = temporal_df.merge(
+            home_features,
+            left_on=['game_id', 'homeTeam_id'],
+            right_on=['game_id', 'team_id'],
+            how='left'
+        )
+        temporal_df.drop('team_id', axis=1, inplace=True, errors='ignore')
+
+        # Merge away team features (no filtering - let merge handle it)
+        away_features = df[['game_id', 'team_id'] + feature_cols].copy()
+        away_features.columns = ['game_id', 'team_id'] + ['away_' + c for c in feature_cols]
+
+        temporal_df = temporal_df.merge(
+            away_features,
+            left_on=['game_id', 'awayTeam_id'],
+            right_on=['game_id', 'team_id'],
+            how='left'
+        )
+        temporal_df.drop('team_id', axis=1, inplace=True, errors='ignore')
+        
+        # Cleanup
+        temporal_df = temporal_df.drop(['homeTeam_id', 'awayTeam_id'], axis=1, errors='ignore')
+        
+        logger.info(f"Generated {len(temporal_df.columns)} total temporal features")
+        return temporal_df

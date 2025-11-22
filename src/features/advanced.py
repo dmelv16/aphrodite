@@ -118,16 +118,16 @@ class AdvancedFeatureEngine:
         
         per_game_events = events_df.groupby(['game_id', 'event_owner_team_id']).apply(
             lambda x: pd.Series({
-                'faceoff_wins_game': (x['type_code'] == '502').sum(),
-                'hits_delivered_game': (x['type_code'] == '503').sum(),
-                'blocked_shots_game': (x['type_code'] == '508').sum(),
-                'giveaways_game': (x['type_code'] == '504').sum(),
-                'takeaways_game': (x['type_code'] == '525').sum(),
-                'penalties_taken_game': (x['type_code'] == '509').sum(),
-                'penalty_minutes_game': x[x['type_code'] == '509']['penalty_duration'].sum(),
+                'faceoff_wins_game': (x['type_code'] == 502).sum(),
+                'hits_delivered_game': (x['type_code'] == 503).sum(),
+                'blocked_shots_game': (x['type_code'] == 508).sum(),
+                'giveaways_game': (x['type_code'] == 504).sum(),
+                'takeaways_game': (x['type_code'] == 525).sum(),
+                'penalties_taken_game': (x['type_code'] == 509).sum(),
+                'penalty_minutes_game': x[x['type_code'] == 509]['penalty_duration'].sum(),
                 'offensive_zone_events_game': (x['zone_code'] == 'O').sum(),
                 'defensive_zone_events_game': (x['zone_code'] == 'D').sum(),
-                'shot_attempts_game': (x['type_code'].isin(['506', '507'])).sum(),
+                'shot_attempts_game': (x['type_code'].isin([506, 507])).sum(),
             })
         ).reset_index()
         per_game_events.rename(columns={'event_owner_team_id': 'team_id'}, inplace=True)
